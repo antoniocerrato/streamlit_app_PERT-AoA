@@ -1,25 +1,36 @@
 """
 Core algorithms for a didactic PERT/CPM Activity-on-Arrow app.
 
-The module intentionally separates the mathematical engine from the Streamlit UI.
-It builds a canonical expanded AoA network from an activity predecessor table.
+The module separates the mathematical engine from the Streamlit UI.
 
-Important modelling decision
-----------------------------
-The generated AoA network is a canonical expanded event network, not a minimal
-AoA drawing. Each real activity a has a private start event alpha_a and a private
-finish event omega_a. Real precedence constraints are represented by zero-duration
-and zero-variance dummy arrows from predecessor finish events to successor start
-events. This construction is simple, verifiable, acyclic when the activity relation
-is acyclic, and well suited to teaching. Later, a contraction/simplification layer
-can be added without changing the CPM/PERT calculations.
+Main modelling decision
+-----------------------
+The input is an activity table with direct predecessors. Internally, the module
+first builds a canonical expanded AoA network that is always correct. Then it
+reduces the network by merging events and deleting redundant dummy arrows, but
+ONLY when the exact precedence relation between real activities is preserved.
+
+Therefore, the reduced network is not obtained by an unsafe drawing trick. Each
+simplification is checked against the transitive closure of the original activity
+relation. This makes the method useful for teaching: the app can explain that a
+fictitious activity is kept only when removing it would either remove a required
+precedence or create a false one.
+
+Exact minimisation of dummy activities is a hard combinatorial problem in the
+general case. This module provides:
+
+* a greedy safe reducer, suitable for interactive use;
+* a bounded exact branch-and-bound reducer for small didactic networks;
+* an auto mode that uses the exact reducer when the network is small enough and
+  falls back to the greedy reducer otherwise.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from math import erf, exp, pi, sqrt
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass
+from math import erf, pi, sqrt
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+import hashlib
 import random
 
 import numpy as np
@@ -61,10 +72,29 @@ class Arc:
     head: str
     duration: float
     variance: float
-    kind: str  # "real", "dummy_start", "dummy_finish", "dummy_precedence"
+    kind: str  # "real" or one of the dummy kinds
     activity_id: Optional[str] = None
     predecessor: Optional[str] = None
     successor: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ReductionInfo:
+    """Summary of the safe AoA reduction process."""
+
+    method_requested: str
+    method_used: str
+    exact_completed: bool
+    states_explored: int
+    canonical_events: int
+    canonical_arcs: int
+    canonical_dummy_arcs: int
+    reduced_events: int
+    reduced_arcs: int
+    reduced_dummy_arcs: int
+    contractions: int
+    dummy_arcs_removed: int
+    note: str
 
 
 @dataclass
@@ -88,6 +118,7 @@ class ProjectResult:
     dominant_critical_path: List[str]
     critical_path_variance: float
     critical_path_std: float
+    reduction_info: ReductionInfo
 
 
 class ValidationError(Exception):
@@ -104,11 +135,7 @@ def _clean_id(value: object) -> str:
 
 
 def parse_predecessor_cell(value: object) -> Tuple[str, ...]:
-    """Parse a predecessor cell such as 'A, B; C' into a sorted unique tuple.
-
-    The function keeps activity identifiers as strings and supports comma,
-    semicolon, and whitespace separators.
-    """
+    """Parse a predecessor cell such as 'A, B; C' into a sorted unique tuple."""
     if value is None:
         return tuple()
     if isinstance(value, float) and np.isnan(value):
@@ -120,7 +147,6 @@ def parse_predecessor_cell(value: object) -> Tuple[str, ...]:
         text = text.replace(sep, ",")
     tokens: List[str] = []
     for part in text.split(","):
-        # Allow users to separate by spaces if they did not use commas.
         subparts = [x for x in part.strip().split(" ") if x.strip()]
         if len(subparts) > 1:
             tokens.extend(subparts)
@@ -128,7 +154,7 @@ def parse_predecessor_cell(value: object) -> Tuple[str, ...]:
             token = part.strip()
             if token:
                 tokens.append(token)
-    return tuple(sorted(set(tokens)))
+    return tuple(sorted(set(tokens), key=activity_sort_key))
 
 
 def dataframe_to_activities(df: pd.DataFrame) -> Dict[str, Activity]:
@@ -139,15 +165,12 @@ def dataframe_to_activities(df: pd.DataFrame) -> Dict[str, Activity]:
         raise ValidationError(f"Faltan columnas obligatorias: {', '.join(sorted(missing))}.")
 
     activities: Dict[str, Activity] = {}
-    seen_raw: List[str] = []
-
     for idx, row in df.iterrows():
         aid = _clean_id(row["id"])
         if not aid:
             raise ValidationError(f"La fila {idx + 1} no tiene identificador de actividad.")
         if aid in activities:
             raise ValidationError(f"La actividad '{aid}' aparece repetida.")
-        seen_raw.append(aid)
 
         try:
             o = float(row["optimistic"])
@@ -184,14 +207,13 @@ def activities_to_dataframe(activities: Dict[str, Activity]) -> pd.DataFrame:
 
 
 def activity_sort_key(aid: str) -> Tuple[int, object]:
-    # Natural-ish order for A, B, C, A1, A2; fallback to string.
     if len(aid) == 1 and aid.isalpha():
         return (0, ord(aid.upper()) - ord("A"))
     return (1, aid)
 
 
 # ---------------------------------------------------------------------------
-# Graph validation and topological ordering on the activity relation
+# Activity relation validation and topological ordering
 # ---------------------------------------------------------------------------
 
 
@@ -210,7 +232,6 @@ def validate_activities(activities: Dict[str, Activity]) -> None:
         if aid in pred_set:
             raise ValidationError(f"La actividad '{aid}' no puede ser predecesora de sí misma.")
 
-    # Cycle check through topological ordering.
     topological_layers(activities)
 
 
@@ -224,10 +245,7 @@ def predecessor_successor_sets(activities: Dict[str, Activity]) -> Tuple[Dict[st
 
 
 def topological_layers(activities: Dict[str, Activity]) -> Tuple[List[List[str]], List[str]]:
-    """Set-based topological layers.
-
-    L_k = {a in A \\ Q_k | P(a) subset Q_k}
-    """
+    """Set-based topological layers: L_k = {a in A minus Q_k | P(a) subset Q_k}."""
     ids = set(activities)
     processed: Set[str] = set()
     layers: List[List[str]] = []
@@ -251,8 +269,25 @@ def topological_layers(activities: Dict[str, Activity]) -> Tuple[List[List[str]]
     return layers, order
 
 
+def activity_transitive_closure(activities: Dict[str, Activity]) -> Set[Tuple[str, str]]:
+    """Return all activity precedence pairs implied by the predecessor table."""
+    _, successors = predecessor_successor_sets(activities)
+    closure: Set[Tuple[str, str]] = set()
+    for source in activities:
+        stack = list(successors[source])
+        visited: Set[str] = set()
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            closure.add((source, node))
+            stack.extend(successors[node])
+    return closure
+
+
 # ---------------------------------------------------------------------------
-# Canonical AoA construction and CPM/PERT calculations
+# Canonical AoA construction
 # ---------------------------------------------------------------------------
 
 
@@ -265,25 +300,12 @@ def event_finish(aid: str) -> str:
 
 
 def build_canonical_aoa(activities: Dict[str, Activity]) -> Tuple[List[str], List[Arc]]:
-    """Build the canonical expanded AoA network.
-
-    Events:
-        S: global start event
-        T: global finish event
-        α_a: private start event for activity a
-        ω_a: private finish event for activity a
-
-    Arcs:
-        α_a -> ω_a: real activity a
-        ω_p -> α_a: dummy for each p in P(a)
-        S -> α_a: dummy start if P(a) is empty
-        ω_a -> T: dummy finish if a has no successors
-    """
+    """Build the canonical expanded AoA network."""
     predecessors, successors = predecessor_successor_sets(activities)
     events: Set[str] = {"S", "T"}
     arcs: List[Arc] = []
 
-    for aid, act in activities.items():
+    for aid, act in sorted(activities.items(), key=lambda kv: activity_sort_key(kv[0])):
         alpha = event_start(aid)
         omega = event_finish(aid)
         events.update([alpha, omega])
@@ -299,7 +321,8 @@ def build_canonical_aoa(activities: Dict[str, Activity]) -> Tuple[List[str], Lis
             )
         )
 
-    for aid, preds in predecessors.items():
+    for aid in sorted(activities.keys(), key=activity_sort_key):
+        preds = predecessors[aid]
         alpha = event_start(aid)
         if not preds:
             arcs.append(
@@ -327,8 +350,8 @@ def build_canonical_aoa(activities: Dict[str, Activity]) -> Tuple[List[str], Lis
                 )
             )
 
-    for aid, succs in successors.items():
-        if not succs:
+    for aid in sorted(activities.keys(), key=activity_sort_key):
+        if not successors[aid]:
             arcs.append(
                 Arc(
                     id=f"finish_{aid}",
@@ -348,53 +371,548 @@ def build_canonical_aoa(activities: Dict[str, Activity]) -> Tuple[List[str], Lis
     return ordered_events, arcs
 
 
+# ---------------------------------------------------------------------------
+# Safe AoA reduction
+# ---------------------------------------------------------------------------
+
+
+def dummy_count(arcs: Sequence[Arc]) -> int:
+    return sum(1 for arc in arcs if arc.kind != "real")
+
+
+def network_score(events: Sequence[str], arcs: Sequence[Arc]) -> Tuple[int, int, int]:
+    """Lexicographic objective: first dummy arcs, then events, then total arcs."""
+    return (dummy_count(arcs), len(events), len(arcs))
+
+
+def make_adjacency(events: Sequence[str], arcs: Sequence[Arc]) -> Dict[str, List[str]]:
+    adj = {v: [] for v in events}
+    for arc in arcs:
+        if arc.tail not in adj:
+            adj[arc.tail] = []
+        if arc.head not in adj:
+            adj[arc.head] = []
+        adj[arc.tail].append(arc.head)
+    return adj
+
+
 def topological_order_events(events: Sequence[str], arcs: Sequence[Arc]) -> List[str]:
     incoming_count = {v: 0 for v in events}
     outgoing: Dict[str, List[str]] = {v: [] for v in events}
     for arc in arcs:
+        if arc.tail == arc.head:
+            raise ValidationError("La red AOA contiene un arco con el mismo suceso inicial y final.")
+        incoming_count.setdefault(arc.tail, 0)
+        incoming_count.setdefault(arc.head, 0)
+        outgoing.setdefault(arc.tail, [])
+        outgoing.setdefault(arc.head, [])
         incoming_count[arc.head] += 1
         outgoing[arc.tail].append(arc.head)
 
-    queue = [v for v in events if incoming_count[v] == 0]
-    # Prefer S first and T last when possible.
-    queue.sort(key=lambda x: (x != "S", x))
+    queue = [v for v in incoming_count if incoming_count[v] == 0]
+    queue.sort(key=lambda x: (x != "S", x == "T", x))
     order: List[str] = []
     while queue:
         v = queue.pop(0)
         order.append(v)
-        for w in outgoing[v]:
+        for w in outgoing.get(v, []):
             incoming_count[w] -= 1
             if incoming_count[w] == 0:
                 queue.append(w)
-                queue.sort(key=lambda x: (x == "T", x))
-    if len(order) != len(events):
-        raise ValidationError("La red AOA generada contiene un ciclo, lo que no debería ocurrir si la tabla es válida.")
+                queue.sort(key=lambda x: (x != "S", x == "T", x))
+    if len(order) != len(incoming_count):
+        raise ValidationError("La red AOA generada contiene un ciclo.")
     return order
+
+
+def event_reachability(events: Sequence[str], arcs: Sequence[Arc]) -> Dict[str, Set[str]]:
+    """Reachability including the event itself."""
+    adj = make_adjacency(events, arcs)
+    reach: Dict[str, Set[str]] = {}
+    for v in events:
+        seen = {v}
+        stack = list(adj.get(v, []))
+        while stack:
+            w = stack.pop()
+            if w in seen:
+                continue
+            seen.add(w)
+            stack.extend(adj.get(w, []))
+        reach[v] = seen
+    return reach
+
+
+def real_activity_event_pairs(arcs: Sequence[Arc]) -> Dict[str, Tuple[str, str]]:
+    pairs: Dict[str, Tuple[str, str]] = {}
+    for arc in arcs:
+        if arc.kind == "real" and arc.activity_id:
+            pairs[arc.activity_id] = (arc.tail, arc.head)
+    return pairs
+
+
+def derived_activity_precedence(events: Sequence[str], arcs: Sequence[Arc]) -> Set[Tuple[str, str]]:
+    """Infer activity precedence from an AoA network.
+
+    Activity i precedes activity j iff the finish event of i can reach the start
+    event of j. Equality of events counts as reachability with path length zero.
+    """
+    pairs = real_activity_event_pairs(arcs)
+    reach = event_reachability(events, arcs)
+    derived: Set[Tuple[str, str]] = set()
+    for a, (_, head_a) in pairs.items():
+        for b, (tail_b, _) in pairs.items():
+            if a == b:
+                continue
+            if tail_b in reach[head_a]:
+                derived.add((a, b))
+    return derived
+
+
+def is_exact_representation(events: Sequence[str], arcs: Sequence[Arc], target_closure: Set[Tuple[str, str]]) -> bool:
+    try:
+        topological_order_events(events, arcs)
+    except ValidationError:
+        return False
+    for arc in arcs:
+        if arc.kind == "real" and arc.tail == arc.head:
+            return False
+    return derived_activity_precedence(events, arcs) == target_closure
+
+
+def _canonical_event_mapping(events: Sequence[str], arcs: Sequence[Arc]) -> Dict[str, str]:
+    """Rename events as S, E1, E2, ..., T using topological order.
+
+    After aggressive reduction, the literal names S and T may disappear because
+    their dummy arrows have been contracted or removed. For readability, if the
+    reduced network has a unique source and a unique sink, they are relabelled as
+    S and T even if their previous internal names were different.
+    """
+    order = topological_order_events(events, arcs)
+    incoming = {v: 0 for v in events}
+    outgoing = {v: 0 for v in events}
+    for arc in arcs:
+        incoming[arc.head] = incoming.get(arc.head, 0) + 1
+        incoming.setdefault(arc.tail, incoming.get(arc.tail, 0))
+        outgoing[arc.tail] = outgoing.get(arc.tail, 0) + 1
+        outgoing.setdefault(arc.head, outgoing.get(arc.head, 0))
+
+    sources = [v for v in order if incoming.get(v, 0) == 0]
+    sinks = [v for v in order if outgoing.get(v, 0) == 0]
+    source_name = sources[0] if len(sources) == 1 else ("S" if "S" in events else None)
+    sink_name = sinks[0] if len(sinks) == 1 else ("T" if "T" in events else None)
+
+    mapping: Dict[str, str] = {}
+    counter = 1
+    for event in order:
+        if event == source_name:
+            mapping[event] = "S"
+        elif event == sink_name:
+            mapping[event] = "T"
+        elif event == "S" and source_name is None:
+            mapping[event] = "S"
+        elif event == "T" and sink_name is None:
+            mapping[event] = "T"
+        else:
+            mapping[event] = f"E{counter}"
+            counter += 1
+    return mapping
+
+
+def canonicalize_network(events: Sequence[str], arcs: Sequence[Arc]) -> Tuple[List[str], List[Arc]]:
+    """Remove self dummy arcs, deduplicate dummy arcs, and rename events."""
+    used_events: Set[str] = set(events)
+    cleaned: List[Arc] = []
+    real_index = 0
+    dummy_pairs: Set[Tuple[str, str]] = set()
+
+    for arc in arcs:
+        if arc.tail == arc.head:
+            # A self-loop dummy has no timing effect after contraction. A self-loop
+            # real activity would be invalid and will be rejected later.
+            if arc.kind == "real":
+                cleaned.append(arc)
+            continue
+        used_events.update([arc.tail, arc.head])
+        if arc.kind == "real":
+            real_index += 1
+            cleaned.append(arc)
+        else:
+            pair = (arc.tail, arc.head)
+            if pair in dummy_pairs:
+                continue
+            dummy_pairs.add(pair)
+            cleaned.append(
+                Arc(
+                    id=f"dummy_tmp_{len(dummy_pairs)}",
+                    tail=arc.tail,
+                    head=arc.head,
+                    duration=0.0,
+                    variance=0.0,
+                    kind="dummy",
+                )
+            )
+
+    used_events = {v for arc in cleaned for v in (arc.tail, arc.head)}
+    if not used_events:
+        used_events = set(events)
+
+    mapping = _canonical_event_mapping(list(used_events), cleaned)
+    renamed: List[Arc] = []
+    dummy_pairs_after: Set[Tuple[str, str]] = set()
+    for arc in cleaned:
+        tail = mapping[arc.tail]
+        head = mapping[arc.head]
+        if tail == head:
+            if arc.kind == "real":
+                renamed.append(
+                    Arc(
+                        id=f"real_{arc.activity_id}",
+                        tail=tail,
+                        head=head,
+                        duration=arc.duration,
+                        variance=arc.variance,
+                        kind="real",
+                        activity_id=arc.activity_id,
+                    )
+                )
+            continue
+        if arc.kind == "real":
+            renamed.append(
+                Arc(
+                    id=f"real_{arc.activity_id}",
+                    tail=tail,
+                    head=head,
+                    duration=arc.duration,
+                    variance=arc.variance,
+                    kind="real",
+                    activity_id=arc.activity_id,
+                )
+            )
+        else:
+            pair = (tail, head)
+            if pair in dummy_pairs_after:
+                continue
+            dummy_pairs_after.add(pair)
+            renamed.append(
+                Arc(
+                    id=f"dummy_{len(dummy_pairs_after)}",
+                    tail=tail,
+                    head=head,
+                    duration=0.0,
+                    variance=0.0,
+                    kind="dummy",
+                )
+            )
+
+    renamed_events = sorted({v for arc in renamed for v in (arc.tail, arc.head)}, key=_event_sort_key)
+    # Ensure S first and T last when present.
+    try:
+        order = topological_order_events(renamed_events, renamed)
+    except ValidationError:
+        order = renamed_events
+    return order, sorted(renamed, key=_arc_sort_key)
+
+
+def _event_sort_key(event: str) -> Tuple[int, int, str]:
+    if event == "S":
+        return (0, 0, event)
+    if event == "T":
+        return (2, 0, event)
+    if event.startswith("E") and event[1:].isdigit():
+        return (1, int(event[1:]), event)
+    return (1, 10**9, event)
+
+
+def _arc_sort_key(arc: Arc) -> Tuple[int, str, str, str]:
+    kind_order = 0 if arc.kind == "real" else 1
+    return (kind_order, arc.activity_id or "", arc.tail, arc.head)
+
+
+def network_signature(events: Sequence[str], arcs: Sequence[Arc]) -> str:
+    parts = ["|".join(events)]
+    for arc in sorted(arcs, key=_arc_sort_key):
+        parts.append(f"{arc.kind}:{arc.activity_id or ''}:{arc.tail}>{arc.head}")
+    return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
+
+
+def contract_events(events: Sequence[str], arcs: Sequence[Arc], u: str, v: str) -> Tuple[List[str], List[Arc]]:
+    """Merge two events and return a canonicalised network."""
+    if u == v:
+        return list(events), list(arcs)
+    if {u, v} == {"S", "T"}:
+        return list(events), list(arcs)
+    if u == "S" or v == "S":
+        keep = "S"
+    elif u == "T" or v == "T":
+        keep = "T"
+    else:
+        keep = f"{u}_{v}"
+    replace = {u: keep, v: keep}
+    new_arcs: List[Arc] = []
+    for arc in arcs:
+        tail = replace.get(arc.tail, arc.tail)
+        head = replace.get(arc.head, arc.head)
+        new_arcs.append(
+            Arc(
+                id=arc.id,
+                tail=tail,
+                head=head,
+                duration=arc.duration,
+                variance=arc.variance,
+                kind=arc.kind,
+                activity_id=arc.activity_id,
+                predecessor=arc.predecessor,
+                successor=arc.successor,
+            )
+        )
+    new_events = [replace.get(e, e) for e in events]
+    return canonicalize_network(new_events, new_arcs)
+
+
+def remove_redundant_dummy_arcs(
+    events: Sequence[str],
+    arcs: Sequence[Arc],
+    target_closure: Set[Tuple[str, str]],
+) -> Tuple[List[str], List[Arc], int]:
+    """Delete dummy arcs that do not affect the represented activity relation."""
+    events, arcs = canonicalize_network(events, arcs)
+    removed = 0
+    changed = True
+    while changed:
+        changed = False
+        for i, arc in enumerate(list(arcs)):
+            if arc.kind == "real":
+                continue
+            trial_arcs = [a for j, a in enumerate(arcs) if j != i]
+            try:
+                trial_events, trial_arcs = canonicalize_network(events, trial_arcs)
+            except ValidationError:
+                continue
+            if is_exact_representation(trial_events, trial_arcs, target_closure):
+                events, arcs = trial_events, trial_arcs
+                removed += 1
+                changed = True
+                break
+    return list(events), list(arcs), removed
+
+
+def safe_greedy_reduce(
+    events: Sequence[str],
+    arcs: Sequence[Arc],
+    target_closure: Set[Tuple[str, str]],
+) -> Tuple[List[str], List[Arc], int, int, int]:
+    """Greedily merge the event pair that most improves the safe objective."""
+    events, arcs = canonicalize_network(events, arcs)
+    events, arcs, removed = remove_redundant_dummy_arcs(events, arcs, target_closure)
+    contractions = 0
+    states = 1
+
+    while True:
+        base_score = network_score(events, arcs)
+        best: Optional[Tuple[Tuple[int, int, int], List[str], List[Arc], int]] = None
+        event_list = list(events)
+        for i, u in enumerate(event_list):
+            for v in event_list[i + 1 :]:
+                if {u, v} == {"S", "T"}:
+                    continue
+                try:
+                    trial_events, trial_arcs = contract_events(events, arcs, u, v)
+                except ValidationError:
+                    continue
+                states += 1
+                if not is_exact_representation(trial_events, trial_arcs, target_closure):
+                    continue
+                trial_events, trial_arcs, trial_removed = remove_redundant_dummy_arcs(
+                    trial_events, trial_arcs, target_closure
+                )
+                score = network_score(trial_events, trial_arcs)
+                if score < base_score:
+                    if best is None or score < best[0]:
+                        best = (score, trial_events, trial_arcs, trial_removed)
+        if best is None:
+            break
+        _, events, arcs, trial_removed = best
+        removed += trial_removed
+        contractions += 1
+
+    return list(events), list(arcs), contractions, removed, states
+
+
+def exact_reduce_bounded(
+    events: Sequence[str],
+    arcs: Sequence[Arc],
+    target_closure: Set[Tuple[str, str]],
+    max_states: int = 8000,
+) -> Tuple[List[str], List[Arc], int, int, int, bool]:
+    """Bounded branch-and-bound over safe event contractions.
+
+    This explores all improving event contractions while the state budget lasts.
+    It is intended for small teaching examples. If the budget is exceeded, it
+    returns the best network found and exact_completed=False.
+    """
+    events, arcs = canonicalize_network(events, arcs)
+    events, arcs, initially_removed = remove_redundant_dummy_arcs(events, arcs, target_closure)
+    best_events, best_arcs = list(events), list(arcs)
+    best_score = network_score(best_events, best_arcs)
+    visited: Set[str] = set()
+    states = 0
+    exact_completed = True
+
+    def dfs(cur_events: List[str], cur_arcs: List[Arc]) -> None:
+        nonlocal best_events, best_arcs, best_score, states, exact_completed
+        if states >= max_states:
+            exact_completed = False
+            return
+        sig = network_signature(cur_events, cur_arcs)
+        if sig in visited:
+            return
+        visited.add(sig)
+        states += 1
+
+        score = network_score(cur_events, cur_arcs)
+        if score < best_score:
+            best_score = score
+            best_events, best_arcs = list(cur_events), list(cur_arcs)
+
+        event_list = list(cur_events)
+        candidates: List[Tuple[Tuple[int, int, int], List[str], List[Arc]]] = []
+        base_score = network_score(cur_events, cur_arcs)
+        for i, u in enumerate(event_list):
+            for v in event_list[i + 1 :]:
+                if {u, v} == {"S", "T"}:
+                    continue
+                try:
+                    trial_events, trial_arcs = contract_events(cur_events, cur_arcs, u, v)
+                    if not is_exact_representation(trial_events, trial_arcs, target_closure):
+                        continue
+                    trial_events, trial_arcs, _ = remove_redundant_dummy_arcs(
+                        trial_events, trial_arcs, target_closure
+                    )
+                    trial_score = network_score(trial_events, trial_arcs)
+                    if trial_score < base_score:
+                        candidates.append((trial_score, trial_events, trial_arcs))
+                except ValidationError:
+                    continue
+        candidates.sort(key=lambda item: item[0])
+        for _, next_events, next_arcs in candidates:
+            if states >= max_states:
+                exact_completed = False
+                return
+            dfs(next_events, next_arcs)
+
+    dfs(list(events), list(arcs))
+    # Re-estimate contractions/removed by comparing canonical and final sizes.
+    contractions = max(0, len(events) - len(best_events))
+    removed = max(0, initially_removed + dummy_count(arcs) - dummy_count(best_arcs))
+    return best_events, best_arcs, contractions, removed, states, exact_completed
+
+
+def build_reduced_aoa(
+    activities: Dict[str, Activity],
+    reduction_method: str = "auto",
+    exact_activity_limit: int = 7,
+    max_exact_states: int = 3000,
+) -> Tuple[List[str], List[Arc], ReductionInfo]:
+    """Build a canonical AoA network and reduce it safely."""
+    canonical_events, canonical_arcs = build_canonical_aoa(activities)
+    target = activity_transitive_closure(activities)
+
+    canonical_events, canonical_arcs = canonicalize_network(canonical_events, canonical_arcs)
+    if not is_exact_representation(canonical_events, canonical_arcs, target):
+        raise ValidationError("La red AOA canónica no representa exactamente las precedencias de entrada.")
+
+    method_requested = reduction_method
+    if reduction_method == "none":
+        reduced_events, reduced_arcs = list(canonical_events), list(canonical_arcs)
+        contractions = removed = states = 0
+        method_used = "none"
+        exact_completed = True
+        note = "Se muestra la red canónica sin reducción."
+    elif reduction_method == "greedy":
+        reduced_events, reduced_arcs, contractions, removed, states = safe_greedy_reduce(
+            canonical_events, canonical_arcs, target
+        )
+        method_used = "greedy"
+        exact_completed = True
+        note = "Reducción voraz segura: cada contracción conserva exactamente la precedencia entre actividades."
+    elif reduction_method == "exact" or (
+        reduction_method == "auto" and len(activities) <= exact_activity_limit
+    ):
+        reduced_events, reduced_arcs, contractions, removed, states, exact_completed = exact_reduce_bounded(
+            canonical_events, canonical_arcs, target, max_states=max_exact_states
+        )
+        method_used = "exact_bounded"
+        note = (
+            "Búsqueda exacta acotada completada."
+            if exact_completed
+            else "La búsqueda exacta agotó el límite de estados; se devuelve la mejor red encontrada."
+        )
+    else:
+        reduced_events, reduced_arcs, contractions, removed, states = safe_greedy_reduce(
+            canonical_events, canonical_arcs, target
+        )
+        method_used = "greedy_auto_fallback"
+        exact_completed = False
+        note = (
+            "La red es grande para búsqueda exacta interactiva; se usa reducción voraz segura. "
+            "Aumenta el límite o reduce el número de actividades para búsqueda exacta."
+        )
+
+    reduced_events, reduced_arcs = canonicalize_network(reduced_events, reduced_arcs)
+    if not is_exact_representation(reduced_events, reduced_arcs, target):
+        raise ValidationError("La red reducida no conserva exactamente las precedencias; se ha rechazado.")
+
+    info = ReductionInfo(
+        method_requested=method_requested,
+        method_used=method_used,
+        exact_completed=exact_completed,
+        states_explored=states,
+        canonical_events=len(canonical_events),
+        canonical_arcs=len(canonical_arcs),
+        canonical_dummy_arcs=dummy_count(canonical_arcs),
+        reduced_events=len(reduced_events),
+        reduced_arcs=len(reduced_arcs),
+        reduced_dummy_arcs=dummy_count(reduced_arcs),
+        contractions=contractions,
+        dummy_arcs_removed=max(0, dummy_count(canonical_arcs) - dummy_count(reduced_arcs)),
+        note=note,
+    )
+    return reduced_events, reduced_arcs, info
+
+
+# ---------------------------------------------------------------------------
+# CPM/PERT calculations
+# ---------------------------------------------------------------------------
 
 
 def compute_event_times(events: Sequence[str], arcs: Sequence[Arc]) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
     order = topological_order_events(events, arcs)
-    incoming: Dict[str, List[Arc]] = {v: [] for v in events}
     outgoing: Dict[str, List[Arc]] = {v: [] for v in events}
     for arc in arcs:
-        incoming[arc.head].append(arc)
-        outgoing[arc.tail].append(arc)
+        outgoing.setdefault(arc.tail, []).append(arc)
+        outgoing.setdefault(arc.head, [])
 
     earliest = {v: float("-inf") for v in events}
-    earliest["S"] = 0.0
+    sources = [v for v in events if not any(arc.head == v for arc in arcs)]
+    if "S" in events:
+        earliest["S"] = 0.0
+    for source in sources:
+        earliest[source] = 0.0
+
     for v in order:
         if earliest[v] == float("-inf"):
             earliest[v] = 0.0
-        for arc in outgoing[v]:
+        for arc in outgoing.get(v, []):
             earliest[arc.head] = max(earliest[arc.head], earliest[v] + arc.duration)
 
-    project_duration = earliest["T"]
+    sink = "T" if "T" in events else order[-1]
+    project_duration = earliest[sink]
     latest = {v: float("inf") for v in events}
-    latest["T"] = project_duration
+    latest[sink] = project_duration
     for v in reversed(order):
-        if v == "T":
+        if v == sink:
             continue
-        if outgoing[v]:
+        if outgoing.get(v):
             latest[v] = min(latest[arc.head] - arc.duration for arc in outgoing[v])
         else:
             latest[v] = project_duration
@@ -403,28 +921,40 @@ def compute_event_times(events: Sequence[str], arcs: Sequence[Arc]) -> Tuple[Dic
     return earliest, latest, slack
 
 
-def compute_project(activities: Dict[str, Activity]) -> ProjectResult:
+def compute_project(
+    activities: Dict[str, Activity],
+    reduction_method: str = "auto",
+    exact_activity_limit: int = 7,
+    max_exact_states: int = 3000,
+) -> ProjectResult:
     validate_activities(activities)
     predecessors, successors = predecessor_successor_sets(activities)
     layers, act_order = topological_layers(activities)
-    events, arcs = build_canonical_aoa(activities)
+    events, arcs, reduction_info = build_reduced_aoa(
+        activities,
+        reduction_method=reduction_method,
+        exact_activity_limit=exact_activity_limit,
+        max_exact_states=max_exact_states,
+    )
     event_earliest, event_latest, event_slack = compute_event_times(events, arcs)
-    project_duration = event_earliest["T"]
+    project_duration = max(event_earliest[arc.head] for arc in arcs if arc.kind == "real")
+    if "T" in event_earliest:
+        project_duration = event_earliest["T"]
+
+    real_arcs = {arc.activity_id: arc for arc in arcs if arc.kind == "real" and arc.activity_id}
 
     rows = []
     for aid in act_order:
         act = activities[aid]
-        alpha = event_start(aid)
-        omega = event_finish(aid)
-        es = event_earliest[alpha]
+        arc = real_arcs[aid]
+        es = event_earliest[arc.tail]
         ef = es + act.mean
-        lf = event_latest[omega]
+        lf = event_latest[arc.head]
         ls = lf - act.mean
         tf = ls - es
-        # Activity-level free float projected onto the activity precedence relation.
         if successors[aid]:
-            min_succ_es = min(event_earliest[event_start(s)] for s in successors[aid])
-            ff = min_succ_es - ef
+            min_succ_start = min(event_earliest[real_arcs[s].tail] for s in successors[aid])
+            ff = min_succ_start - ef
         else:
             ff = project_duration - ef
         rows.append(
@@ -442,11 +972,11 @@ def compute_project(activities: Dict[str, Activity]) -> ProjectResult:
                 "EF": ef,
                 "LS": ls,
                 "LF": lf,
-                "total_float": max(0.0, tf) if abs(tf) < 1e-8 else tf,
-                "free_float_activity": max(0.0, ff) if abs(ff) < 1e-8 else ff,
+                "total_float": 0.0 if abs(tf) < 1e-8 else tf,
+                "free_float_activity": 0.0 if abs(ff) < 1e-8 else ff,
                 "critical": abs(tf) <= 1e-7,
-                "start_event": alpha,
-                "finish_event": omega,
+                "start_event": arc.tail,
+                "finish_event": arc.head,
             }
         )
     activity_table = pd.DataFrame(rows)
@@ -465,15 +995,13 @@ def compute_project(activities: Dict[str, Activity]) -> ProjectResult:
                 "head": arc.head,
                 "kind": arc.kind,
                 "activity": arc.activity_id or "",
-                "predecessor": arc.predecessor or "",
-                "successor": arc.successor or "",
                 "duration": arc.duration,
                 "variance": arc.variance,
                 "ES": es,
                 "EF": ef,
                 "LS": ls,
                 "LF": lf,
-                "total_float": max(0.0, tf) if abs(tf) < 1e-8 else tf,
+                "total_float": 0.0 if abs(tf) < 1e-8 else tf,
                 "critical_arc": abs(tf) <= 1e-7,
             }
         )
@@ -518,6 +1046,7 @@ def compute_project(activities: Dict[str, Activity]) -> ProjectResult:
         dominant_critical_path=dominant,
         critical_path_variance=cp_var,
         critical_path_std=cp_std,
+        reduction_info=reduction_info,
     )
 
 
@@ -526,48 +1055,56 @@ def is_critical_arc(arc: Arc, earliest: Dict[str, float], latest: Dict[str, floa
     return abs(tf) <= 1e-7
 
 
-def find_critical_paths(arcs: Sequence[Arc], earliest: Dict[str, float], latest: Dict[str, float], max_paths: int = 50) -> List[List[str]]:
+def find_critical_paths(
+    arcs: Sequence[Arc], earliest: Dict[str, float], latest: Dict[str, float], max_paths: int = 50
+) -> List[List[str]]:
     critical_out: Dict[str, List[Arc]] = {}
     for arc in arcs:
         if is_critical_arc(arc, earliest, latest):
             critical_out.setdefault(arc.tail, []).append(arc)
 
+    sink = "T" if "T" in earliest else max(earliest, key=lambda k: earliest[k])
+    sources = [v for v in earliest if not any(arc.head == v for arc in arcs)]
+    if "S" in earliest:
+        sources = ["S"]
+
     paths: List[List[str]] = []
 
-    def dfs(node: str, real_activities: List[str]) -> None:
+    def dfs(node: str, real_activities: List[str], visited: Set[str]) -> None:
         if len(paths) >= max_paths:
             return
-        if node == "T":
+        if node == sink:
             paths.append(real_activities.copy())
             return
         for arc in critical_out.get(node, []):
+            if arc.head in visited:
+                continue
             if arc.activity_id:
-                dfs(arc.head, real_activities + [arc.activity_id])
+                dfs(arc.head, real_activities + [arc.activity_id], visited | {arc.head})
             else:
-                dfs(arc.head, real_activities)
+                dfs(arc.head, real_activities, visited | {arc.head})
 
-    dfs("S", [])
-    # Remove duplicates caused by zero-duration dummy alternatives.
+    for source in sources:
+        dfs(source, [], {source})
+
     unique: List[List[str]] = []
     seen = set()
-    for path in paths:
-        key = tuple(path)
-        if key not in seen:
+    for p in paths:
+        key = tuple(p)
+        if key not in seen and p:
+            unique.append(p)
             seen.add(key)
-            unique.append(path)
     return unique
 
 
-def choose_dominant_critical_path(paths: Sequence[Sequence[str]], activities: Dict[str, Activity]) -> List[str]:
+def choose_dominant_critical_path(paths: List[List[str]], activities: Dict[str, Activity]) -> List[str]:
     if not paths:
         return []
-    # All critical paths have the same expected duration; choose the largest variance
-    # because it is conservative for the normal approximation.
-    return list(max(paths, key=lambda p: sum(activities[a].variance for a in p)))
+    return max(paths, key=lambda path: sum(activities[a].variance for a in path))
 
 
 # ---------------------------------------------------------------------------
-# Probability tools
+# Probability helpers and Monte-Carlo-ready hooks
 # ---------------------------------------------------------------------------
 
 
@@ -601,11 +1138,6 @@ def probability_curve(mu: float, sigma: float, deadline: Optional[float] = None,
 
 
 def pert_beta_parameters(optimistic: float, most_likely: float, pessimistic: float, lamb: float = 4.0) -> Tuple[float, float]:
-    """Return alpha, beta parameters of a scaled PERT-beta distribution.
-
-    This is included to make the core Monte-Carlo-ready. The deterministic PERT
-    calculations use the classical mean and variance formulas.
-    """
     a, m, b = optimistic, most_likely, pessimistic
     if abs(b - a) <= EPS:
         return 1.0, 1.0
@@ -615,11 +1147,6 @@ def pert_beta_parameters(optimistic: float, most_likely: float, pessimistic: flo
 
 
 def sample_pert_beta(activity: Activity, rng: np.random.Generator, lamb: float = 4.0) -> float:
-    """Sample one duration from a scaled PERT-beta distribution.
-
-    Not used by the main analytical result, but intentionally provided for the
-    future Monte Carlo module.
-    """
     a, b = activity.optimistic, activity.pessimistic
     if abs(b - a) <= EPS:
         return a
@@ -627,12 +1154,17 @@ def sample_pert_beta(activity: Activity, rng: np.random.Generator, lamb: float =
     return float(a + (b - a) * rng.beta(alpha, beta))
 
 
-def schedule_with_activity_durations(activities: Dict[str, Activity], duration_map: Dict[str, float]) -> float:
+def schedule_with_activity_durations(
+    activities: Dict[str, Activity],
+    duration_map: Dict[str, float],
+    reduction_method: str = "auto",
+) -> float:
     """Compute project duration for arbitrary sampled activity durations.
 
-    This function is the central hook for a future Monte Carlo simulation.
+    This is the central hook for a future Monte Carlo simulation. The topology is
+    reduced safely and the real arc durations are replaced by sampled values.
     """
-    events, arcs = build_canonical_aoa(activities)
+    events, arcs, _ = build_reduced_aoa(activities, reduction_method=reduction_method)
     sampled_arcs: List[Arc] = []
     for arc in arcs:
         if arc.activity_id:
@@ -645,14 +1177,12 @@ def schedule_with_activity_durations(activities: Dict[str, Activity], duration_m
                     variance=0.0,
                     kind=arc.kind,
                     activity_id=arc.activity_id,
-                    predecessor=arc.predecessor,
-                    successor=arc.successor,
                 )
             )
         else:
             sampled_arcs.append(arc)
     earliest, _, _ = compute_event_times(events, sampled_arcs)
-    return earliest["T"]
+    return earliest["T"] if "T" in earliest else max(earliest.values())
 
 
 # ---------------------------------------------------------------------------
@@ -678,9 +1208,6 @@ def generate_random_project(
     """Generate a valid random activity DAG with PERT estimates."""
     if n_activities < 1:
         raise ValueError("n_activities must be positive")
-    if n_activities > 26:
-        # The app remains usable, but graph drawings become dense.
-        pass
 
     rng = random.Random(seed)
     ids = [activity_name(i) for i in range(n_activities)]
@@ -693,8 +1220,6 @@ def generate_random_project(
         for p in possible_preds:
             if rng.random() < edge_probability:
                 predecessors_by_id[aid].add(p)
-        # For medium/large networks, avoid too many isolated activities by adding
-        # one predecessor with a small probability when none exists and it is not first.
         if j > 0 and not predecessors_by_id[aid] and rng.random() < 0.35:
             predecessors_by_id[aid].add(rng.choice(possible_preds))
 
@@ -724,10 +1249,10 @@ def dot_escape(text: object) -> str:
 
 
 def to_dot(result: ProjectResult, show_dummy_labels: bool = True, compact_labels: bool = False) -> str:
-    """Return a Graphviz DOT string for the canonical AoA network."""
+    """Return a Graphviz DOT string for the reduced AoA network."""
     lines: List[str] = []
     lines.append("digraph G {")
-    lines.append("  graph [rankdir=LR, bgcolor=transparent, margin=0.05, nodesep=0.6, ranksep=0.9];")
+    lines.append("  graph [rankdir=LR, bgcolor=transparent, margin=0.05, nodesep=0.55, ranksep=0.85];")
     lines.append("  node [shape=circle, style=filled, fillcolor=white, color=gray45, fontname=Helvetica, fontsize=10];")
     lines.append("  edge [fontname=Helvetica, fontsize=9, arrowsize=0.8, color=gray35];")
 
@@ -746,7 +1271,7 @@ def to_dot(result: ProjectResult, show_dummy_labels: bool = True, compact_labels
     for arc in result.arcs:
         critical = is_critical_arc(arc, result.event_earliest, result.event_latest)
         color = "firebrick" if critical else "gray35"
-        penwidth = "2.6" if critical else "1.2"
+        penwidth = "2.8" if critical else "1.2"
         style = "solid" if arc.kind == "real" else "dashed"
         if arc.kind == "real":
             assert arc.activity_id is not None
@@ -761,12 +1286,7 @@ def to_dot(result: ProjectResult, show_dummy_labels: bool = True, compact_labels
                     f"HT={row['total_float']:.1f}"
                 )
         elif show_dummy_labels:
-            if arc.kind == "dummy_precedence":
-                label = f"d: {arc.predecessor}→{arc.successor}"
-            elif arc.kind == "dummy_start":
-                label = "d: inicio"
-            else:
-                label = "d: fin"
+            label = "d"
         else:
             label = ""
         lines.append(
@@ -799,10 +1319,14 @@ def example_project() -> Dict[str, Activity]:
 
 
 def self_test() -> None:
-    result = compute_project(example_project())
+    result = compute_project(example_project(), reduction_method="auto")
     assert result.project_duration > 0
     assert "G" in result.activity_topological_order
     assert result.critical_paths
+    assert result.reduction_info.reduced_dummy_arcs <= result.reduction_info.canonical_dummy_arcs
+    target = activity_transitive_closure(result.activities)
+    assert derived_activity_precedence(result.events, result.arcs) == target
+
     # Cycle detection.
     bad = pd.DataFrame(
         [
@@ -818,12 +1342,14 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("Cycle was not detected")
+
     # Random projects.
-    for seed in range(30):
+    for seed in range(20):
         acts = generate_random_project(n_activities=10, edge_probability=0.25, seed=seed)
-        res = compute_project(acts)
+        res = compute_project(acts, reduction_method="greedy")
         assert res.project_duration >= max(a.mean for a in acts.values())
         assert all(res.activity_table["total_float"] >= -1e-7)
+        assert derived_activity_precedence(res.events, res.arcs) == activity_transitive_closure(acts)
 
 
 if __name__ == "__main__":

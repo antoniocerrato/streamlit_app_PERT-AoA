@@ -1,30 +1,45 @@
-# PERT/CPM Activity on Arrow — Streamlit App
+# PERT/CPM Activity on Arrow — Streamlit
 
-Aplicación didáctica para construir y analizar redes PERT/CPM con representación **Activity on Arrow (AOA)**.
+Aplicación didáctica para construir y analizar redes **PERT/CPM con Activity on Arrow (AOA)** a partir de una tabla de actividades y predecesoras.
 
-## Características
+La versión actual incorpora una mejora importante: la red ya no se queda en la construcción canónica expandida, sino que aplica una **reducción segura de actividades ficticias**.
 
-- Entrada editable de actividades reales.
-- Estimaciones PERT de tres valores: optimista, más probable y pesimista.
+## Características principales
+
+- Entrada editable de actividades.
 - Generación aleatoria de proyectos válidos.
+- Estimaciones PERT de tres valores:
+  - optimista;
+  - más probable;
+  - pesimista.
 - Validación de:
   - actividades repetidas;
-  - predecesoras inexistentes;
+  - predecesoras desconocidas;
   - autorrelaciones;
   - ciclos.
-- Construcción de una red AOA canónica expandida.
-- Representación gráfica mediante Graphviz.
-- Cálculo de sucesos tempranos y tardíos.
-- Cálculo por actividad de:
-  - `ES`: inicio temprano;
-  - `EF`: final temprano;
-  - `LS`: inicio tardío;
-  - `LF`: final tardío;
+- Construcción de una red AOA canónica correcta.
+- Reducción segura de ficticias mediante:
+  - contracción de sucesos;
+  - eliminación de ficticias redundantes;
+  - verificación exacta de la relación de precedencia.
+- Modos de reducción:
+  - `auto`;
+  - `greedy`;
+  - `exact`;
+  - `none`.
+- Cálculo de:
+  - tiempos tempranos de sucesos;
+  - tiempos tardíos de sucesos;
+  - ES, EF, LS, LF por actividad;
   - holgura total;
-  - holgura libre proyectada a nivel de actividad.
-- Identificación de actividades y caminos críticos.
-- Distribución probabilística aproximada de la duración del proyecto.
-- Arquitectura preparada para añadir Monte Carlo posteriormente.
+  - holgura libre proyectada;
+  - actividades críticas;
+  - caminos críticos.
+- Representación Graphviz de la red AOA.
+- Gráfica de distribución probabilística aproximada de la duración del proyecto.
+- Cálculo de probabilidad de cumplir un plazo.
+- Apartado de teoría integrado en la app.
+- Motor preparado para incorporar Monte Carlo posteriormente.
 
 ## Instalación
 
@@ -38,36 +53,71 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Estructura
+## Estructura del proyecto
 
 ```text
 pert_aoa_streamlit_app/
-├── app.py              # Interfaz Streamlit
-├── pert_aoa_core.py    # Motor matemático y algorítmico
-├── THEORY.md           # Teoría integrada en la aplicación
-├── example_project.csv # Proyecto de ejemplo
-├── requirements.txt    # Dependencias
-└── README.md           # Este documento
+├── app.py                # Interfaz Streamlit
+├── pert_aoa_core.py      # Motor matemático y algorítmico
+├── THEORY.md             # Teoría integrada en la app
+├── example_project.csv   # Datos de ejemplo
+├── requirements.txt      # Dependencias
+└── README.md             # Este documento
 ```
 
-## Decisión de modelización
+## Idea matemática de la reducción
 
-La aplicación usa una **red AOA canónica expandida**, no una red AOA mínima. Cada actividad real tiene un suceso propio de inicio y un suceso propio de fin. Las relaciones de precedencia se representan mediante actividades ficticias de duración cero.
+La aplicación parte de una red canónica expandida que siempre representa correctamente la tabla de predecesoras.
 
-Esta construcción es especialmente adecuada para docencia porque es:
+Después intenta reducir ficticias. Una reducción solo se acepta si conserva exactamente esta equivalencia:
 
-- correcta por construcción;
-- fácil de verificar;
-- transparente para el estudiante;
-- robusta para cálculos computacionales;
-- ampliable a Monte Carlo.
+```text
+actividad i precede a actividad j en la tabla
+⇔
+el suceso final de i alcanza el suceso inicial de j en la red AOA
+```
 
-## Monte Carlo futuro
+Por tanto, la app no elimina una ficticia si al hacerlo:
 
-El archivo `pert_aoa_core.py` ya incluye funciones pensadas para esa ampliación:
+- desaparece una precedencia necesaria; o
+- aparece una precedencia falsa.
+
+La función objetivo de reducción es:
+
+```text
+J(G) = (número de ficticias, número de sucesos, número total de flechas)
+```
+
+El orden es lexicográfico: primero se intenta minimizar el número de ficticias.
+
+## Modos de reducción
+
+### auto
+
+Usa búsqueda exacta acotada para redes pequeñas y reducción voraz segura para redes mayores.
+
+### exact
+
+Explora muchas contracciones posibles hasta el límite de estados definido en la barra lateral.
+
+Es útil para ejemplos pequeños, pero puede ser costoso.
+
+### greedy
+
+En cada paso aplica la mejor contracción segura disponible.
+
+Es rápido y adecuado para uso interactivo. No garantiza mínimo global en redes grandes, pero siempre conserva la lógica de precedencias.
+
+### none
+
+Muestra la red canónica expandida sin reducir. Sirve para comparar.
+
+## Preparación para Monte Carlo
+
+El archivo `pert_aoa_core.py` incluye funciones pensadas para la futura simulación:
 
 - `pert_beta_parameters`;
 - `sample_pert_beta`;
 - `schedule_with_activity_durations`.
 
-La futura simulación deberá muestrear duraciones de actividades, recalcular la red y guardar la duración final del proyecto en cada iteración.
+La reducción de la red depende solo de la topología, no de las duraciones. Por eso, en una simulación Monte Carlo, la misma red reducida puede reutilizarse con duraciones aleatorias en cada iteración.

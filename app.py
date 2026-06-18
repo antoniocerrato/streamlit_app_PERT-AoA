@@ -96,15 +96,40 @@ with st.sidebar:
     st.button("Generar proyecto aleatorio", on_click=reset_with_random, use_container_width=True)
     st.button("Cargar ejemplo didáctico", on_click=reset_with_example, use_container_width=True)
     st.divider()
+    st.header("Reducción AOA")
+    st.selectbox(
+        "Método de reducción",
+        options=["auto", "greedy", "exact", "none"],
+        index=0,
+        key="reduction_method",
+        help=(
+            "auto usa búsqueda exacta acotada en redes pequeñas y reducción voraz segura en redes grandes. "
+            "none muestra la red canónica sin compactar."
+        ),
+    )
+    st.number_input(
+        "Límite de actividades para búsqueda exacta",
+        min_value=2,
+        max_value=18,
+        value=7,
+        step=1,
+        key="exact_activity_limit",
+    )
+    st.number_input(
+        "Máximo de estados en búsqueda exacta",
+        min_value=500,
+        max_value=100000,
+        value=3000,
+        step=500,
+        key="max_exact_states",
+    )
     st.markdown(
         """
         **Modelo usado**
 
-        La red generada es una **AOA canónica expandida**:
-
-        - cada actividad real es una flecha;
-        - cada precedencia directa se representa mediante una flecha ficticia;
-        - las actividades ficticias tienen duración y varianza cero.
+        La app parte de una red AOA canónica correcta y después la reduce.
+        Una contracción solo se acepta si conserva exactamente la relación de
+        precedencia entre actividades reales.
         """
     )
 
@@ -161,7 +186,12 @@ with tabs[0]:
 
     try:
         activities = dataframe_to_activities(edited)
-        result = compute_project(activities)
+        result = compute_project(
+            activities,
+            reduction_method=st.session_state.get("reduction_method", "auto"),
+            exact_activity_limit=st.session_state.get("exact_activity_limit", 7),
+            max_exact_states=st.session_state.get("max_exact_states", 3000),
+        )
         st.success("La tabla es válida: no hay referencias desconocidas, autorrelaciones ni ciclos.")
         st.markdown("**Capas topológicas de actividades**")
         layer_text = " → ".join(["{" + ", ".join(layer) + "}" for layer in result.activity_layers])
@@ -173,13 +203,24 @@ with tabs[0]:
 
 if result is not None:
     with tabs[1]:
-        st.subheader("Red Activity on Arrow canónica")
+        st.subheader("Red Activity on Arrow reducida")
         st.markdown(
             """
             En esta representación, las **actividades reales** son flechas continuas y las **actividades ficticias** son flechas discontinuas.
             Las flechas rojas pertenecen a algún camino crítico de la red generada.
+
+            La red se ha compactado de forma segura: la aplicación comprueba que la alcanzabilidad entre actividades
+            reales sigue siendo exactamente la misma que en la tabla de predecesoras.
             """
         )
+        info = result.reduction_info
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ficticias canónicas", str(info.canonical_dummy_arcs))
+        m2.metric("Ficticias finales", str(info.reduced_dummy_arcs), delta=-(info.canonical_dummy_arcs - info.reduced_dummy_arcs))
+        m3.metric("Sucesos", f"{info.reduced_events}", delta=-(info.canonical_events - info.reduced_events))
+        m4.metric("Método", info.method_used)
+        st.caption(info.note + f" Estados explorados: {info.states_explored}.")
+
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             show_dummy_labels = st.checkbox("Mostrar etiquetas de ficticias", value=True)
@@ -199,6 +240,22 @@ if result is not None:
 
         st.markdown("### Tabla de flechas AOA")
         st.dataframe(result.arc_table.round(4), use_container_width=True, hide_index=True)
+
+        with st.expander("Comprobación didáctica de la reducción"):
+            st.markdown(
+                f"""
+                La red canónica tenía **{info.canonical_dummy_arcs}** actividades ficticias y
+                **{info.canonical_events}** sucesos. La red reducida tiene **{info.reduced_dummy_arcs}**
+                actividades ficticias y **{info.reduced_events}** sucesos.
+
+                Una reducción se acepta únicamente si cumple esta equivalencia lógica:
+
+                `actividad i precede a actividad j en la tabla`  ⇔  `el final de i alcanza el inicio de j en la red AOA`.
+
+                Por eso la app no elimina una ficticia si al hacerlo aparece una precedencia falsa o desaparece una
+                precedencia necesaria.
+                """
+            )
 
     with tabs[2]:
         st.subheader("Resultados CPM/PERT por actividad")
@@ -336,6 +393,8 @@ if result is not None:
             """
             La aplicación todavía muestra como resultado principal la aproximación analítica clásica de PERT.
             Sin embargo, el motor está organizado para añadir Monte Carlo después sin reescribir la aplicación.
+            La reducción AOA es topológica: no depende de las duraciones muestreadas, por lo que puede reutilizarse
+            en cada iteración.
 
             La futura simulación debería hacer lo siguiente:
 
