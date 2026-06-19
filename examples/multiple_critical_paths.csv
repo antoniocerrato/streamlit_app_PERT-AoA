@@ -1,0 +1,6 @@
+id,optimistic,most_likely,pessimistic,predecessors
+A,2,2,2,
+B,2,2,2,
+C,3,3,3,A
+D,3,3,3,B
+E,1,1,1,"C, D"

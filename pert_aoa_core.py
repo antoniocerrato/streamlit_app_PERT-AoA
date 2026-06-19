@@ -121,6 +121,21 @@ class ProjectResult:
     reduction_info: ReductionInfo
 
 
+@dataclass
+class MonteCarloResult:
+    """Empirical Monte Carlo results for random activity durations."""
+
+    n_iter: int
+    seed: Optional[int]
+    durations: np.ndarray
+    duration_summary: pd.DataFrame
+    activity_stats: pd.DataFrame
+    event_stats: pd.DataFrame
+    deadline: Optional[float]
+    deadline_probability: Optional[float]
+    reduction_info: ReductionInfo
+
+
 class ValidationError(Exception):
     """Raised when the input table cannot define a valid project network."""
 
@@ -227,10 +242,14 @@ def validate_activities(activities: Dict[str, Activity]) -> None:
         unknown = pred_set.difference(ids)
         if unknown:
             raise ValidationError(
-                f"La actividad '{aid}' contiene predecesoras no definidas: {', '.join(sorted(unknown))}."
+                f"La actividad '{aid}' contiene predecesoras no definidas: {', '.join(sorted(unknown))}. "
+                "Añade esas actividades a la tabla o elimínalas de sus predecesoras."
             )
         if aid in pred_set:
-            raise ValidationError(f"La actividad '{aid}' no puede ser predecesora de sí misma.")
+            raise ValidationError(
+                f"La actividad '{aid}' no puede ser predecesora de sí misma. "
+                "Elimina esa referencia de la columna de predecesoras."
+            )
 
     topological_layers(activities)
 
@@ -1152,6 +1171,190 @@ def sample_pert_beta(activity: Activity, rng: np.random.Generator, lamb: float =
         return a
     alpha, beta = pert_beta_parameters(activity.optimistic, activity.most_likely, activity.pessimistic, lamb)
     return float(a + (b - a) * rng.beta(alpha, beta))
+
+
+def _stats_dict(values: np.ndarray, prefix: str) -> Dict[str, float]:
+    values = np.asarray(values, dtype=float)
+    result = {
+        f"{prefix}_mean": float(np.mean(values)),
+        f"{prefix}_std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
+        f"{prefix}_min": float(np.min(values)),
+        f"{prefix}_p05": float(np.percentile(values, 5)),
+        f"{prefix}_p50": float(np.percentile(values, 50)),
+        f"{prefix}_p80": float(np.percentile(values, 80)),
+        f"{prefix}_p90": float(np.percentile(values, 90)),
+        f"{prefix}_p95": float(np.percentile(values, 95)),
+        f"{prefix}_max": float(np.max(values)),
+    }
+    return result
+
+
+def monte_carlo_simulation(
+    activities: Dict[str, Activity],
+    n_iter: int = 10000,
+    seed: Optional[int] = None,
+    reduction_method: str = "auto",
+    exact_activity_limit: int = 7,
+    max_exact_states: int = 3000,
+    deadline: Optional[float] = None,
+    lamb: float = 4.0,
+) -> MonteCarloResult:
+    """Simulate project duration and criticality using beta-PERT activity durations.
+
+    The AoA topology is reduced once because it depends only on precedence. Each
+    iteration samples real activity durations and recomputes CPM event times.
+    """
+    if n_iter <= 0:
+        raise ValueError("n_iter must be positive")
+
+    validate_activities(activities)
+    events, arcs, reduction_info = build_reduced_aoa(
+        activities,
+        reduction_method=reduction_method,
+        exact_activity_limit=exact_activity_limit,
+        max_exact_states=max_exact_states,
+    )
+    order = topological_order_events(events, arcs)
+    event_index = {event: i for i, event in enumerate(events)}
+    ordered_indices = [event_index[event] for event in order]
+    activity_order = topological_layers(activities)[1]
+    activity_index = {aid: i for i, aid in enumerate(activity_order)}
+
+    tail_idx = np.array([event_index[arc.tail] for arc in arcs], dtype=int)
+    head_idx = np.array([event_index[arc.head] for arc in arcs], dtype=int)
+    real_arc_activity: List[Optional[str]] = [arc.activity_id if arc.kind == "real" else None for arc in arcs]
+
+    outgoing_by_event: Dict[int, List[int]] = {i: [] for i in range(len(events))}
+    incoming_by_event: Dict[int, List[int]] = {i: [] for i in range(len(events))}
+    for arc_idx, (tail, head) in enumerate(zip(tail_idx, head_idx)):
+        outgoing_by_event[int(tail)].append(arc_idx)
+        incoming_by_event[int(head)].append(arc_idx)
+
+    source_indices = [i for i in range(len(events)) if not incoming_by_event[i]]
+    sink_name = "T" if "T" in event_index else None
+    sink_idx = event_index[sink_name] if sink_name else -1
+
+    rng = np.random.default_rng(seed)
+    n_events = len(events)
+    n_activities = len(activity_order)
+    durations = np.zeros(n_iter, dtype=float)
+    event_earliest = np.zeros((n_iter, n_events), dtype=float)
+    event_latest = np.zeros((n_iter, n_events), dtype=float)
+    event_slack = np.zeros((n_iter, n_events), dtype=float)
+    activity_durations = np.zeros((n_iter, n_activities), dtype=float)
+    activity_es = np.zeros((n_iter, n_activities), dtype=float)
+    activity_ef = np.zeros((n_iter, n_activities), dtype=float)
+    activity_ls = np.zeros((n_iter, n_activities), dtype=float)
+    activity_lf = np.zeros((n_iter, n_activities), dtype=float)
+    activity_float = np.zeros((n_iter, n_activities), dtype=float)
+    activity_critical = np.zeros((n_iter, n_activities), dtype=bool)
+    event_critical = np.zeros((n_iter, n_events), dtype=bool)
+
+    for iteration in range(n_iter):
+        arc_durations = np.zeros(len(arcs), dtype=float)
+        for arc_idx, aid in enumerate(real_arc_activity):
+            if aid is None:
+                continue
+            sampled = sample_pert_beta(activities[aid], rng, lamb=lamb)
+            arc_durations[arc_idx] = sampled
+            activity_durations[iteration, activity_index[aid]] = sampled
+
+        earliest = np.full(n_events, float("-inf"), dtype=float)
+        for idx in source_indices:
+            earliest[idx] = 0.0
+        if "S" in event_index:
+            earliest[event_index["S"]] = 0.0
+
+        for idx in ordered_indices:
+            if earliest[idx] == float("-inf"):
+                earliest[idx] = 0.0
+            for arc_idx in outgoing_by_event[idx]:
+                head = head_idx[arc_idx]
+                candidate = earliest[idx] + arc_durations[arc_idx]
+                if candidate > earliest[head]:
+                    earliest[head] = candidate
+
+        current_sink_idx = sink_idx if sink_idx >= 0 else int(np.argmax(earliest))
+        project_duration = float(earliest[current_sink_idx])
+        latest = np.full(n_events, float("inf"), dtype=float)
+        latest[current_sink_idx] = project_duration
+        for idx in reversed(ordered_indices):
+            if idx == current_sink_idx:
+                continue
+            outgoing = outgoing_by_event[idx]
+            if outgoing:
+                latest[idx] = min(latest[head_idx[arc_idx]] - arc_durations[arc_idx] for arc_idx in outgoing)
+            else:
+                latest[idx] = project_duration
+
+        durations[iteration] = project_duration
+        event_earliest[iteration, :] = earliest
+        event_latest[iteration, :] = latest
+        slack = latest - earliest
+        event_slack[iteration, :] = slack
+        event_critical[iteration, :] = np.abs(slack) <= 1e-7
+
+        for arc_idx, aid in enumerate(real_arc_activity):
+            if aid is None:
+                continue
+            idx = activity_index[aid]
+            es = earliest[tail_idx[arc_idx]]
+            ef = es + arc_durations[arc_idx]
+            lf = latest[head_idx[arc_idx]]
+            ls = lf - arc_durations[arc_idx]
+            tf = ls - es
+            activity_es[iteration, idx] = es
+            activity_ef[iteration, idx] = ef
+            activity_ls[iteration, idx] = ls
+            activity_lf[iteration, idx] = lf
+            activity_float[iteration, idx] = 0.0 if abs(tf) < 1e-8 else tf
+            activity_critical[iteration, idx] = abs(tf) <= 1e-7
+
+    duration_row = {"n_iter": n_iter}
+    duration_row.update(_stats_dict(durations, "project_duration"))
+    if deadline is not None:
+        duration_row["deadline"] = float(deadline)
+        duration_row["deadline_probability"] = float(np.mean(durations <= deadline))
+    duration_summary = pd.DataFrame([duration_row])
+
+    activity_rows = []
+    for aid in activity_order:
+        idx = activity_index[aid]
+        row = {
+            "activity": aid,
+            "critical_probability": float(np.mean(activity_critical[:, idx])),
+        }
+        row.update(_stats_dict(activity_durations[:, idx], "duration"))
+        row.update(_stats_dict(activity_es[:, idx], "early_start"))
+        row.update(_stats_dict(activity_ef[:, idx], "early_finish"))
+        row.update(_stats_dict(activity_ls[:, idx], "late_start"))
+        row.update(_stats_dict(activity_lf[:, idx], "late_finish"))
+        row.update(_stats_dict(activity_float[:, idx], "total_float"))
+        activity_rows.append(row)
+
+    event_rows = []
+    for event in events:
+        idx = event_index[event]
+        row = {
+            "event": event,
+            "critical_probability": float(np.mean(event_critical[:, idx])),
+        }
+        row.update(_stats_dict(event_earliest[:, idx], "early_time"))
+        row.update(_stats_dict(event_latest[:, idx], "late_time"))
+        row.update(_stats_dict(event_slack[:, idx], "slack"))
+        event_rows.append(row)
+
+    return MonteCarloResult(
+        n_iter=n_iter,
+        seed=seed,
+        durations=durations,
+        duration_summary=duration_summary,
+        activity_stats=pd.DataFrame(activity_rows),
+        event_stats=pd.DataFrame(event_rows),
+        deadline=deadline,
+        deadline_probability=float(np.mean(durations <= deadline)) if deadline is not None else None,
+        reduction_info=reduction_info,
+    )
 
 
 def schedule_with_activity_durations(

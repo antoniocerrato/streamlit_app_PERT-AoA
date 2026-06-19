@@ -38,8 +38,12 @@ La versión actual incorpora una mejora importante: la red ya no se queda en la 
 - Representación Graphviz de la red AOA.
 - Gráfica de distribución probabilística aproximada de la duración del proyecto.
 - Cálculo de probabilidad de cumplir un plazo.
+- Simulación Monte Carlo con:
+  - distribución empírica de la duración total;
+  - fechas simuladas de comienzo y finalización por actividad;
+  - tiempos simulados por suceso;
+  - probabilidad empírica de pertenecer al camino crítico.
 - Apartado de teoría integrado en la app.
-- Motor preparado para incorporar Monte Carlo posteriormente.
 
 ## Instalación
 
@@ -60,6 +64,8 @@ pert_aoa_streamlit_app/
 ├── app.py                # Interfaz Streamlit
 ├── pert_aoa_core.py      # Motor matemático y algorítmico
 ├── THEORY.md             # Teoría integrada en la app
+├── examples/             # Casos didácticos pequeños en CSV
+├── tests/                # Pruebas unitarias con unittest
 ├── example_project.csv   # Datos de ejemplo
 ├── requirements.txt      # Dependencias
 └── README.md             # Este documento
@@ -112,12 +118,32 @@ Es rápido y adecuado para uso interactivo. No garantiza mínimo global en redes
 
 Muestra la red canónica expandida sin reducir. Sirve para comparar.
 
-## Preparación para Monte Carlo
+## Comprobación
 
-El archivo `pert_aoa_core.py` incluye funciones pensadas para la futura simulación:
+La batería mínima de comprobación puede ejecutarse con:
+
+```bash
+python -m py_compile app.py pert_aoa_core.py
+python -m unittest discover
+```
+
+También se mantiene una prueba interna rápida:
+
+```bash
+python -c "from pert_aoa_core import self_test; self_test(); print('self_test ok')"
+```
+
+La carpeta `examples/` contiene redes pequeñas para revisar casos lineales, uniones paralelas, diamantes, predecesoras compartidas y caminos críticos múltiples.
+
+## Simulación Monte Carlo
+
+El archivo `pert_aoa_core.py` incluye una simulación Monte Carlo basada en la misma topología AOA reducida:
 
 - `pert_beta_parameters`;
 - `sample_pert_beta`;
 - `schedule_with_activity_durations`.
+- `monte_carlo_simulation`.
 
-La reducción de la red depende solo de la topología, no de las duraciones. Por eso, en una simulación Monte Carlo, la misma red reducida puede reutilizarse con duraciones aleatorias en cada iteración.
+La reducción de la red depende solo de la topología, no de las duraciones. Por eso, la misma red reducida se reutiliza con duraciones aleatorias en cada iteración.
+
+La pestaña Monte Carlo muestra la distribución empírica del proyecto, la probabilidad de cumplir un plazo, estadísticas por actividad y estadísticas por suceso. La columna `critical_probability` estima la frecuencia con la que una actividad o suceso resulta crítico en las simulaciones.

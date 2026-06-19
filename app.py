@@ -15,6 +15,7 @@ from pert_aoa_core import (
     dataframe_to_activities,
     example_project,
     generate_random_project,
+    monte_carlo_simulation,
     normal_cdf,
     probability_curve,
     to_dot,
@@ -141,7 +142,7 @@ tabs = st.tabs(
         "3. Cálculo CPM/PERT",
         "4. Distribución probabilística",
         "5. Teoría",
-        "6. Monte Carlo después",
+        "6. Monte Carlo",
     ]
 )
 
@@ -192,6 +193,14 @@ with tabs[0]:
             exact_activity_limit=st.session_state.get("exact_activity_limit", 7),
             max_exact_states=st.session_state.get("max_exact_states", 3000),
         )
+        canonical_result = result
+        if result.reduction_info.method_used != "none":
+            canonical_result = compute_project(
+                activities,
+                reduction_method="none",
+                exact_activity_limit=st.session_state.get("exact_activity_limit", 7),
+                max_exact_states=st.session_state.get("max_exact_states", 3000),
+            )
         st.success("La tabla es válida: no hay referencias desconocidas, autorrelaciones ni ciclos.")
         st.markdown("**Capas topológicas de actividades**")
         layer_text = " → ".join(["{" + ", ".join(layer) + "}" for layer in result.activity_layers])
@@ -199,11 +208,12 @@ with tabs[0]:
     except ValidationError as exc:
         st.error(str(exc))
         result = None
+        canonical_result = None
 
 
 if result is not None:
     with tabs[1]:
-        st.subheader("Red Activity on Arrow reducida")
+        st.subheader("Red Activity on Arrow")
         st.markdown(
             """
             En esta representación, las **actividades reales** son flechas continuas y las **actividades ficticias** son flechas discontinuas.
@@ -221,6 +231,39 @@ if result is not None:
         m4.metric("Método", info.method_used)
         st.caption(info.note + f" Estados explorados: {info.states_explored}.")
 
+        with st.expander("Resumen de reducción", expanded=True):
+            reduction_summary = pd.DataFrame(
+                [
+                    {
+                        "red": "Canónica",
+                        "sucesos": info.canonical_events,
+                        "flechas": info.canonical_arcs,
+                        "ficticias": info.canonical_dummy_arcs,
+                    },
+                    {
+                        "red": "Reducida",
+                        "sucesos": info.reduced_events,
+                        "flechas": info.reduced_arcs,
+                        "ficticias": info.reduced_dummy_arcs,
+                    },
+                ]
+            )
+            st.dataframe(reduction_summary, use_container_width=True, hide_index=True)
+            st.write(
+                f"Contracciones aceptadas: **{info.contractions}**. "
+                f"Ficticias eliminadas: **{info.dummy_arcs_removed}**."
+            )
+
+        network_view = st.radio(
+            "Red a visualizar",
+            options=["Reducida", "Canónica", "Comparación"],
+            horizontal=True,
+            help=(
+                "La red canónica es la construcción expandida correcta; la reducida conserva la misma lógica "
+                "con menos ficticias cuando es posible."
+            ),
+        )
+
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             show_dummy_labels = st.checkbox("Mostrar etiquetas de ficticias", value=True)
@@ -229,8 +272,20 @@ if result is not None:
         with c3:
             st.metric("Duración esperada del proyecto", f"{result.project_duration:.2f}")
 
-        dot = to_dot(result, show_dummy_labels=show_dummy_labels, compact_labels=compact_labels)
-        st.graphviz_chart(dot, use_container_width=True)
+        if network_view == "Comparación":
+            left, right = st.columns(2)
+            with left:
+                st.markdown("### Canónica")
+                canonical_dot = to_dot(canonical_result, show_dummy_labels=show_dummy_labels, compact_labels=True)
+                st.graphviz_chart(canonical_dot, use_container_width=True)
+            with right:
+                st.markdown("### Reducida")
+                dot = to_dot(result, show_dummy_labels=show_dummy_labels, compact_labels=True)
+                st.graphviz_chart(dot, use_container_width=True)
+        else:
+            graph_result = canonical_result if network_view == "Canónica" else result
+            dot = to_dot(graph_result, show_dummy_labels=show_dummy_labels, compact_labels=compact_labels)
+            st.graphviz_chart(dot, use_container_width=True)
 
         with st.expander("Ver código DOT del grafo"):
             st.code(dot, language="dot")
@@ -388,41 +443,160 @@ if result is not None:
         st.markdown(load_theory())
 
     with tabs[5]:
-        st.subheader("Preparada para Monte Carlo")
+        st.subheader("Simulación Monte Carlo")
         st.markdown(
             """
-            La aplicación todavía muestra como resultado principal la aproximación analítica clásica de PERT.
-            Sin embargo, el motor está organizado para añadir Monte Carlo después sin reescribir la aplicación.
-            La reducción AOA es topológica: no depende de las duraciones muestreadas, por lo que puede reutilizarse
-            en cada iteración.
-
-            La futura simulación debería hacer lo siguiente:
-
-            1. Para cada iteración, muestrear una duración aleatoria de cada actividad real.
-            2. Recalcular la red AOA con esas duraciones.
-            3. Guardar la duración total del proyecto.
-            4. Repetir el proceso muchas veces.
-            5. Construir un histograma empírico de la duración del proyecto.
-            6. Estimar probabilidades como `P(T ≤ D)` directamente desde las simulaciones.
-
-            El archivo `pert_aoa_core.py` ya incluye las funciones base:
-
-            - `pert_beta_parameters`;
-            - `sample_pert_beta`;
-            - `schedule_with_activity_durations`.
+            La simulación reutiliza una única topología AOA reducida y, en cada iteración, muestrea duraciones
+            beta-PERT para las actividades reales. Así estima directamente la distribución empírica de la duración
+            total, las fechas de comienzo y terminación, y la probabilidad de que cada actividad pertenezca al camino crítico.
             """
         )
-        st.code(
-            """
-# Esquema de la futura simulación Monte Carlo
-for k in range(n_iter):
-    durations = {}
-    for activity in activities:
-        durations[activity.id] = sample_pert_beta(activity, rng)
-    project_duration[k] = schedule_with_activity_durations(activities, durations)
-            """.strip(),
-            language="python",
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        with mc1:
+            mc_iter = st.number_input(
+                "Iteraciones",
+                min_value=100,
+                max_value=50000,
+                value=5000,
+                step=500,
+                key="mc_iter",
+            )
+        with mc2:
+            mc_seed = st.number_input("Semilla", min_value=0, max_value=999999, value=1234, step=1, key="mc_seed")
+        with mc3:
+            mc_lambda = st.slider("Lambda beta-PERT", min_value=1.0, max_value=10.0, value=4.0, step=0.5, key="mc_lambda")
+        with mc4:
+            mc_deadline = st.number_input(
+                "Plazo objetivo",
+                min_value=0.0,
+                value=float(result.project_duration),
+                step=0.5,
+                key="mc_deadline",
+            )
+
+        mc_signature = (
+            edited.to_csv(index=False),
+            int(mc_iter),
+            int(mc_seed),
+            float(mc_lambda),
+            float(mc_deadline),
+            st.session_state.get("reduction_method", "auto"),
+            st.session_state.get("exact_activity_limit", 7),
+            st.session_state.get("max_exact_states", 3000),
         )
+
+        if st.button("Ejecutar simulación Monte Carlo", type="primary", use_container_width=True):
+            with st.spinner("Simulando duraciones y recalculando CPM..."):
+                st.session_state["mc_result"] = monte_carlo_simulation(
+                    activities,
+                    n_iter=int(mc_iter),
+                    seed=int(mc_seed),
+                    reduction_method=st.session_state.get("reduction_method", "auto"),
+                    exact_activity_limit=st.session_state.get("exact_activity_limit", 7),
+                    max_exact_states=st.session_state.get("max_exact_states", 3000),
+                    deadline=float(mc_deadline),
+                    lamb=float(mc_lambda),
+                )
+                st.session_state["mc_signature"] = mc_signature
+
+        mc_result = st.session_state.get("mc_result")
+        if mc_result is None:
+            st.info("Ejecuta la simulación para obtener resultados empíricos.")
+        elif st.session_state.get("mc_signature") != mc_signature:
+            st.warning("Los datos o parámetros han cambiado. Ejecuta de nuevo la simulación para actualizar los resultados.")
+        else:
+            summary = mc_result.duration_summary.round(4)
+            p_deadline = mc_result.deadline_probability if mc_result.deadline_probability is not None else float("nan")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Media simulada", f"{summary.loc[0, 'project_duration_mean']:.2f}")
+            s2.metric("P50", f"{summary.loc[0, 'project_duration_p50']:.2f}")
+            s3.metric("P90", f"{summary.loc[0, 'project_duration_p90']:.2f}")
+            s4.metric("P(T ≤ plazo)", f"{100 * p_deadline:.1f} %")
+
+            fig_mc, ax_mc = plt.subplots(figsize=(9, 4.5))
+            ax_mc.hist(mc_result.durations, bins=35, density=True, alpha=0.45, label="Histograma")
+            sorted_durations = np.sort(mc_result.durations)
+            ecdf = np.arange(1, len(sorted_durations) + 1) / len(sorted_durations)
+            ax_ecdf = ax_mc.twinx()
+            ax_ecdf.plot(sorted_durations, ecdf, color="firebrick", linewidth=2, label="ECDF")
+            ax_mc.axvline(float(mc_deadline), linestyle=":", linewidth=2, color="black", label="Plazo")
+            ax_mc.set_xlabel("Duración del proyecto")
+            ax_mc.set_ylabel("Densidad empírica")
+            ax_ecdf.set_ylabel("Probabilidad acumulada")
+            ax_mc.grid(True, alpha=0.25)
+            ax_mc.legend(loc="upper left")
+            ax_ecdf.legend(loc="lower right")
+            st.pyplot(fig_mc, use_container_width=True)
+
+            st.markdown("### Estadísticas por actividad")
+            activity_cols = [
+                "activity",
+                "critical_probability",
+                "duration_mean",
+                "early_start_mean",
+                "early_start_p05",
+                "early_start_p50",
+                "early_start_p95",
+                "early_finish_mean",
+                "early_finish_p05",
+                "early_finish_p50",
+                "early_finish_p95",
+                "late_start_mean",
+                "late_finish_mean",
+                "total_float_mean",
+            ]
+            st.dataframe(
+                mc_result.activity_stats[activity_cols].round(4),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("### Estadísticas por sucesos")
+            event_cols = [
+                "event",
+                "critical_probability",
+                "early_time_mean",
+                "early_time_p05",
+                "early_time_p50",
+                "early_time_p95",
+                "late_time_mean",
+                "late_time_p05",
+                "late_time_p50",
+                "late_time_p95",
+                "slack_mean",
+            ]
+            st.dataframe(
+                mc_result.event_stats[event_cols].round(4),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                st.download_button(
+                    "Descargar resumen Monte Carlo",
+                    mc_result.duration_summary.to_csv(index=False).encode("utf-8"),
+                    file_name="pert_aoa_monte_carlo_summary.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with d2:
+                st.download_button(
+                    "Descargar actividades Monte Carlo",
+                    mc_result.activity_stats.to_csv(index=False).encode("utf-8"),
+                    file_name="pert_aoa_monte_carlo_activities.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with d3:
+                st.download_button(
+                    "Descargar sucesos Monte Carlo",
+                    mc_result.event_stats.to_csv(index=False).encode("utf-8"),
+                    file_name="pert_aoa_monte_carlo_events.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
 else:
     for tab in tabs[1:]:
