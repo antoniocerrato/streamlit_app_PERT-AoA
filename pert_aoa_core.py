@@ -29,8 +29,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import erf, pi, sqrt
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import hashlib
+import json
 import random
 
 import numpy as np
@@ -172,12 +173,72 @@ def parse_predecessor_cell(value: object) -> Tuple[str, ...]:
     return tuple(sorted(set(tokens), key=activity_sort_key))
 
 
+def json_to_activity_dataframe(text: str) -> pd.DataFrame:
+    """Parse a JSON activity example into the editable activity table format."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"El texto no es JSON válido: {exc.msg}.") from exc
+
+    if isinstance(payload, dict):
+        if "activities" not in payload:
+            raise ValidationError("El JSON debe contener una clave 'activities' o ser una lista de actividades.")
+        payload = payload["activities"]
+
+    if not isinstance(payload, list):
+        raise ValidationError("El JSON debe ser una lista de actividades.")
+
+    rows: List[Dict[str, Any]] = []
+    uses_duration = False
+    uses_three_point = False
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            raise ValidationError(f"La actividad JSON número {index} debe ser un objeto.")
+
+        row: Dict[str, Any] = {"id": item.get("id", "")}
+        if "duration" in item:
+            row["duration"] = item["duration"]
+            uses_duration = True
+        if {"optimistic", "most_likely", "pessimistic"}.issubset(item):
+            row["optimistic"] = item["optimistic"]
+            row["most_likely"] = item["most_likely"]
+            row["pessimistic"] = item["pessimistic"]
+            uses_three_point = True
+
+        predecessors = item.get("predecessors", "")
+        if isinstance(predecessors, list):
+            predecessors = ", ".join(str(value) for value in predecessors)
+        row["predecessors"] = predecessors
+        rows.append(row)
+
+    if not rows:
+        raise ValidationError("El JSON no contiene actividades.")
+    if uses_duration and uses_three_point:
+        raise ValidationError("Usa 'duration' o las tres estimaciones PERT, pero no mezcles ambos formatos.")
+
+    if uses_duration:
+        columns = ["id", "duration", "predecessors"]
+    elif uses_three_point:
+        columns = ["id", "optimistic", "most_likely", "pessimistic", "predecessors"]
+    else:
+        raise ValidationError(
+            "Cada actividad debe incluir 'duration' o 'optimistic', 'most_likely' y 'pessimistic'."
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 def dataframe_to_activities(df: pd.DataFrame) -> Dict[str, Activity]:
     """Convert a Streamlit/Pandas table into validated Activity objects."""
-    required = {"id", "optimistic", "most_likely", "pessimistic", "predecessors"}
+    has_three_point = {"optimistic", "most_likely", "pessimistic"}.issubset(df.columns)
+    has_single_duration = "duration" in df.columns
+    required = {"id", "predecessors"}
     missing = required.difference(df.columns)
     if missing:
         raise ValidationError(f"Faltan columnas obligatorias: {', '.join(sorted(missing))}.")
+    if not has_three_point and not has_single_duration:
+        raise ValidationError(
+            "Falta la columna 'duration' o las columnas 'optimistic', 'most_likely' y 'pessimistic'."
+        )
 
     activities: Dict[str, Activity] = {}
     for idx, row in df.iterrows():
@@ -187,12 +248,19 @@ def dataframe_to_activities(df: pd.DataFrame) -> Dict[str, Activity]:
         if aid in activities:
             raise ValidationError(f"La actividad '{aid}' aparece repetida.")
 
-        try:
-            o = float(row["optimistic"])
-            m = float(row["most_likely"])
-            p = float(row["pessimistic"])
-        except Exception as exc:
-            raise ValidationError(f"La actividad '{aid}' tiene estimaciones no numéricas.") from exc
+        if has_three_point:
+            try:
+                o = float(row["optimistic"])
+                m = float(row["most_likely"])
+                p = float(row["pessimistic"])
+            except Exception as exc:
+                raise ValidationError(f"La actividad '{aid}' tiene estimaciones no numéricas.") from exc
+        else:
+            try:
+                duration = float(row["duration"])
+            except Exception as exc:
+                raise ValidationError(f"La actividad '{aid}' tiene una duración no numérica.") from exc
+            o = m = p = duration
 
         if not (0 <= o <= m <= p):
             raise ValidationError(
@@ -205,19 +273,22 @@ def dataframe_to_activities(df: pd.DataFrame) -> Dict[str, Activity]:
     return activities
 
 
-def activities_to_dataframe(activities: Dict[str, Activity]) -> pd.DataFrame:
+def activities_to_dataframe(activities: Dict[str, Activity], duration_mode: str = "pert") -> pd.DataFrame:
     rows = []
     for aid in sorted(activities.keys(), key=activity_sort_key):
         act = activities[aid]
-        rows.append(
-            {
-                "id": act.id,
-                "optimistic": act.optimistic,
-                "most_likely": act.most_likely,
-                "pessimistic": act.pessimistic,
-                "predecessors": ", ".join(act.predecessors),
-            }
-        )
+        row = {"id": act.id, "predecessors": ", ".join(act.predecessors)}
+        if duration_mode == "single":
+            row["duration"] = act.mean
+        else:
+            row.update(
+                {
+                    "optimistic": act.optimistic,
+                    "most_likely": act.most_likely,
+                    "pessimistic": act.pessimistic,
+                }
+            )
+        rows.append(row)
     return pd.DataFrame(rows)
 
 

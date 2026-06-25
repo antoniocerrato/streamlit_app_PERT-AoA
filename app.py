@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+import json
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -52,8 +53,50 @@ def load_theory() -> str:
     return "# Teoría\n\nNo se ha encontrado el archivo THEORY.md."
 
 
+def duration_mode() -> str:
+    return st.session_state.get("duration_mode", "pert")
+
+
+def table_for_duration_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Return the editable table columns expected by the selected duration mode."""
+    result = pd.DataFrame()
+    result["id"] = df["id"] if "id" in df.columns else ""
+
+    if mode == "single":
+        if "duration" in df.columns:
+            result["duration"] = df["duration"]
+        elif {"optimistic", "most_likely", "pessimistic"}.issubset(df.columns):
+            o = pd.to_numeric(df["optimistic"], errors="coerce")
+            m = pd.to_numeric(df["most_likely"], errors="coerce")
+            p = pd.to_numeric(df["pessimistic"], errors="coerce")
+            result["duration"] = (o + 4.0 * m + p) / 6.0
+        else:
+            result["duration"] = 0.0
+    else:
+        if {"optimistic", "most_likely", "pessimistic"}.issubset(df.columns):
+            result["optimistic"] = df["optimistic"]
+            result["most_likely"] = df["most_likely"]
+            result["pessimistic"] = df["pessimistic"]
+        elif "duration" in df.columns:
+            result["optimistic"] = df["duration"]
+            result["most_likely"] = df["duration"]
+            result["pessimistic"] = df["duration"]
+        else:
+            result["optimistic"] = 0.0
+            result["most_likely"] = 0.0
+            result["pessimistic"] = 0.0
+
+    result["predecessors"] = df["predecessors"] if "predecessors" in df.columns else ""
+    return result
+
+
+def set_activity_table(df: pd.DataFrame) -> None:
+    st.session_state["activity_df"] = df
+    st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+
+
 def reset_with_example() -> None:
-    st.session_state["activity_df"] = activities_to_dataframe(example_project())
+    set_activity_table(activities_to_dataframe(example_project(), duration_mode=duration_mode()))
 
 
 def reset_with_random() -> None:
@@ -71,8 +114,90 @@ def reset_with_random() -> None:
         max_spread=spread,
         seed=seed,
     )
-    st.session_state["activity_df"] = activities_to_dataframe(activities)
+    set_activity_table(activities_to_dataframe(activities, duration_mode=duration_mode()))
 
+
+JSON_EXAMPLE = """[
+  {"id": "A", "duration": 4, "predecessors": []},
+  {"id": "B", "duration": 3, "predecessors": ["A"]},
+  {"id": "C", "duration": 5, "predecessors": ["A"]},
+  {"id": "D", "duration": 2, "predecessors": ["B", "C"]}
+]"""
+
+
+def json_to_activity_dataframe(text: str) -> pd.DataFrame:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"El texto no es JSON válido: {exc.msg}.") from exc
+
+    if isinstance(payload, dict):
+        if "activities" not in payload:
+            raise ValidationError("El JSON debe contener una clave 'activities' o ser una lista de actividades.")
+        payload = payload["activities"]
+    if not isinstance(payload, list):
+        raise ValidationError("El JSON debe ser una lista de actividades.")
+
+    rows = []
+    uses_duration = False
+    uses_three_point = False
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            raise ValidationError(f"La actividad JSON número {index} debe ser un objeto.")
+        row = {"id": item.get("id", "")}
+        if "duration" in item:
+            row["duration"] = item["duration"]
+            uses_duration = True
+        if {"optimistic", "most_likely", "pessimistic"}.issubset(item):
+            row["optimistic"] = item["optimistic"]
+            row["most_likely"] = item["most_likely"]
+            row["pessimistic"] = item["pessimistic"]
+            uses_three_point = True
+        predecessors = item.get("predecessors", "")
+        if isinstance(predecessors, list):
+            predecessors = ", ".join(str(value) for value in predecessors)
+        row["predecessors"] = predecessors
+        rows.append(row)
+
+    if not rows:
+        raise ValidationError("El JSON no contiene actividades.")
+    if uses_duration and uses_three_point:
+        raise ValidationError("Usa 'duration' o las tres estimaciones PERT, pero no mezcles ambos formatos.")
+    if uses_duration:
+        columns = ["id", "duration", "predecessors"]
+    elif uses_three_point:
+        columns = ["id", "optimistic", "most_likely", "pessimistic", "predecessors"]
+    else:
+        raise ValidationError(
+            "Cada actividad debe incluir 'duration' o 'optimistic', 'most_likely' y 'pessimistic'."
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+@st.dialog("Introducir ejemplo en JSON")
+def json_input_dialog() -> None:
+    st.markdown(
+        """
+        Puedes usar una lista de actividades o un objeto con clave `activities`.
+        Cada actividad debe incluir `id`, `predecessors` y `duration`, o bien las tres estimaciones PERT.
+        """
+    )
+    text = st.text_area("JSON", value=JSON_EXAMPLE, height=280)
+    if st.button("Cargar JSON", type="primary", use_container_width=True):
+        try:
+            df = json_to_activity_dataframe(text)
+            dataframe_to_activities(df)
+        except ValidationError as exc:
+            st.error(str(exc))
+        else:
+            set_activity_table(table_for_duration_mode(df, duration_mode()))
+            st.session_state.pop("mc_result", None)
+            st.session_state.pop("mc_signature", None)
+            st.rerun()
+
+
+if "duration_mode" not in st.session_state:
+    st.session_state["duration_mode"] = "pert"
 
 if "activity_df" not in st.session_state:
     reset_with_example()
@@ -86,6 +211,19 @@ st.caption(
 
 
 with st.sidebar:
+    st.header("Tipo de duración")
+    selected_duration_mode = st.radio(
+        "Datos de duración",
+        options=["pert", "single"],
+        format_func=lambda value: "Tres estimaciones PERT" if value == "pert" else "Una duración",
+        index=0 if duration_mode() == "pert" else 1,
+    )
+    if selected_duration_mode != duration_mode():
+        st.session_state["duration_mode"] = selected_duration_mode
+        set_activity_table(table_for_duration_mode(st.session_state["activity_df"], selected_duration_mode))
+        st.rerun()
+    st.divider()
+
     st.header("Entrada aleatoria")
     st.number_input("Número de actividades", min_value=2, max_value=24, value=8, step=1, key="n_activities")
     st.slider("Probabilidad de precedencia", min_value=0.0, max_value=0.8, value=0.25, step=0.05, key="edge_probability")
@@ -96,6 +234,8 @@ with st.sidebar:
     st.number_input("Dispersión máxima", min_value=0, max_value=100, value=6, step=1, key="max_spread")
     st.button("Generar proyecto aleatorio", on_click=reset_with_random, use_container_width=True)
     st.button("Cargar ejemplo didáctico", on_click=reset_with_example, use_container_width=True)
+    if st.button("Introducir JSON manualmente", use_container_width=True):
+        json_input_dialog()
     st.divider()
     st.header("Reducción AOA")
     st.selectbox(
@@ -160,19 +300,31 @@ with tabs[0]:
         - `pessimistic`: duración pesimista.
         """
     )
+    if duration_mode() == "single":
+        st.info("Modo activo: introduce una sola duración por actividad. Internamente se usa como o = m = p.")
 
-    edited = st.data_editor(
-        st.session_state["activity_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
+    if duration_mode() == "single":
+        column_config = {
+            "id": st.column_config.TextColumn("Actividad", required=True),
+            "duration": st.column_config.NumberColumn("Duración", min_value=0.0, step=0.5, format="%.2f"),
+            "predecessors": st.column_config.TextColumn("Predecesoras directas"),
+        }
+    else:
+        column_config = {
             "id": st.column_config.TextColumn("Actividad", required=True),
             "optimistic": st.column_config.NumberColumn("Optimista", min_value=0.0, step=0.5, format="%.2f"),
             "most_likely": st.column_config.NumberColumn("Más probable", min_value=0.0, step=0.5, format="%.2f"),
             "pessimistic": st.column_config.NumberColumn("Pesimista", min_value=0.0, step=0.5, format="%.2f"),
             "predecessors": st.column_config.TextColumn("Predecesoras directas"),
-        },
+        }
+
+    edited = st.data_editor(
+        table_for_duration_mode(st.session_state["activity_df"], duration_mode()),
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config=column_config,
         hide_index=True,
+        key=f"activity_editor_{duration_mode()}_{st.session_state.get('editor_version', 0)}",
     )
     st.session_state["activity_df"] = edited
 
