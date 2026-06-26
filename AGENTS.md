@@ -75,6 +75,14 @@ El modo `exact` es acotado y apto para redes pequeñas. El modo `greedy` es ráp
 
 ## Comandos de comprobación
 
+En este equipo, no confiar en `python` del PATH: puede apuntar al alias de Microsoft Store. Para ejecutar la app y las pruebas, usar el entorno Conda:
+
+```powershell
+D:\Usuarios\antonio\anaconda3\envs\streamlit-apps\python.exe
+```
+
+El entorno contiene Python 3.11 y Streamlit. Si `conda env list` falla por plugins de Conda, usar directamente el ejecutable anterior.
+
 Antes de proponer cambios relevantes, ejecutar al menos:
 
 ```bash
@@ -86,10 +94,31 @@ print('self_test ok')
 PY
 ```
 
+Equivalente recomendado en PowerShell para este equipo:
+
+```powershell
+& "$env:USERPROFILE\anaconda3\envs\streamlit-apps\python.exe" -m py_compile app.py pert_aoa_core.py
+& "$env:USERPROFILE\anaconda3\envs\streamlit-apps\python.exe" -c "from pert_aoa_core import self_test; self_test(); print('self_test ok')"
+& "$env:USERPROFILE\anaconda3\envs\streamlit-apps\python.exe" -m unittest discover -s tests -v
+```
+
+Si `py_compile` falla por permisos escribiendo en `__pycache__`, redirigir la caché de bytecode a una carpeta temporal:
+
+```powershell
+$env:PYTHONPYCACHEPREFIX="$env:TEMP\codex_pycache"
+& "$env:USERPROFILE\anaconda3\envs\streamlit-apps\python.exe" -m py_compile app.py pert_aoa_core.py
+```
+
 Para probar la interfaz:
 
 ```bash
 streamlit run app.py
+```
+
+Equivalente recomendado en PowerShell:
+
+```powershell
+& "$env:USERPROFILE\anaconda3\envs\streamlit-apps\python.exe" -m streamlit run app.py
 ```
 
 ## Reglas específicas para Markdown y LaTeX

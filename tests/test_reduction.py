@@ -11,6 +11,7 @@ from pert_aoa_core import (
     derived_activity_precedence,
     dummy_count,
     generate_random_project,
+    has_unique_real_activity_event_pairs,
     topological_order_events,
 )
 
@@ -78,12 +79,20 @@ class ReductionTests(unittest.TestCase):
         self.assertEqual(info.canonical_dummy_arcs, info.reduced_dummy_arcs)
         self.assert_exact_precedence(activities, result.events, result.arcs)
 
+    def test_reduction_does_not_merge_parallel_real_activities(self):
+        activities = make_activities(CASES["diamond"])
+        events, arcs, info = build_reduced_aoa(activities, reduction_method="greedy")
+        self.assert_exact_precedence(activities, events, arcs)
+        self.assertTrue(has_unique_real_activity_event_pairs(arcs))
+        self.assertGreater(info.reduced_dummy_arcs, 0)
+
     def test_random_projects_preserve_exact_precedence(self):
         for seed in range(10):
             with self.subTest(seed=seed):
                 activities = generate_random_project(n_activities=9, edge_probability=0.3, seed=seed)
                 result = compute_project(activities, reduction_method="greedy")
                 self.assert_exact_precedence(activities, result.events, result.arcs)
+                self.assertTrue(has_unique_real_activity_event_pairs(result.arcs))
                 self.assertTrue((result.activity_table["total_float"] >= -1e-7).all())
 
 

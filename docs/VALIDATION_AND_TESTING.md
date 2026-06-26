@@ -34,11 +34,21 @@ $$
 u\xrightarrow{a}u
 $$
 
-### 3. La red AOA debe ser acíclica
+### 3. Dos actividades reales no pueden compartir el mismo par de sucesos
+
+Si dos actividades reales son distintas, sus pares de sucesos inicial/final también deben ser distintos:
+
+$$
+a\neq b \Longrightarrow (i_a,j_a)\neq(i_b,j_b)
+$$
+
+Esta condición mantiene la identificabilidad AOA de las actividades reales. Sin ella, una reducción podría representar dos actividades reales paralelas como flechas entre los mismos dos sucesos y ocultar una ficticia necesaria.
+
+### 4. La red AOA debe ser acíclica
 
 Después de construir o reducir la red debe existir un orden topológico de sucesos.
 
-### 4. La relación de precedencia debe conservarse exactamente
+### 5. La relación de precedencia debe conservarse exactamente
 
 Para cada par de actividades reales $i,j$:
 
@@ -46,7 +56,7 @@ $$
 i\prec_P j \iff i\prec_G j
 $$
 
-### 5. Las ficticias tienen duración y varianza cero
+### 6. Las ficticias tienen duración y varianza cero
 
 Toda actividad ficticia debe cumplir:
 
@@ -58,11 +68,11 @@ $$
 \sigma^2=0
 $$
 
-### 6. Las actividades reales conservan duración y varianza
+### 7. Las actividades reales conservan duración y varianza
 
 La reducción no debe modificar la duración esperada ni la varianza de las actividades reales.
 
-### 7. El cálculo CPM debe ser coherente
+### 8. El cálculo CPM debe ser coherente
 
 Para cada actividad real:
 
@@ -78,7 +88,17 @@ $$
 TF=LS-ES
 $$
 
-### 8. Las actividades críticas deben tener holgura total cero
+Si la red reducida tiene varios sucesos terminales, todos deben inicializarse en el recorrido hacia atrás con la duración total del proyecto:
+
+$$
+T_P=\max_{z\in Z}E_z
+$$
+
+$$
+L_z=T_P \quad \text{para todo sumidero } z\in Z
+$$
+
+### 9. Las actividades críticas deben tener holgura total cero
 
 Con tolerancia numérica `EPS`.
 
@@ -121,6 +141,7 @@ Esperado:
 
 - D debe esperar a B y C;
 - B y C no deben precederse entre sí;
+- B y C no deben quedar como actividades reales con el mismo suceso inicial y final;
 - debe existir una reducción razonable de ficticias.
 
 ### Caso con predecesoras compartidas
@@ -174,8 +195,10 @@ Generar muchos DAG aleatorios y comprobar:
 
 1. la red reducida es acíclica;
 2. la representación exacta se conserva;
-3. el número de ficticias finales no supera al canónico;
-4. el cálculo de tiempos no falla.
+3. las actividades reales mantienen pares de sucesos distintos;
+4. el número de ficticias finales no supera al canónico;
+5. el cálculo de tiempos no falla;
+6. no aparecen holguras negativas por elegir incorrectamente un único sumidero final.
 
 ## Pruebas futuras para Monte Carlo
 

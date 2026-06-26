@@ -88,6 +88,8 @@ Por tanto, la app no elimina una ficticia si al hacerlo:
 - desaparece una precedencia necesaria; o
 - aparece una precedencia falsa.
 
+Además, la reducción conserva la identificabilidad AOA de las actividades reales: dos actividades reales distintas no pueden terminar representadas con el mismo suceso inicial y el mismo suceso final. Por eso algunas ficticias se mantienen aunque la precedencia lógica parezca conservarse visualmente; son necesarias para distinguir actividades reales paralelas dentro de la convención Activity on Arrow.
+
 La función objetivo de reducción es:
 
 ```text

@@ -130,6 +130,14 @@ para todo par de actividades reales $i,j\in A$.
 
 Este es el criterio más importante del proyecto.
 
+La aplicación conserva además una condición de identificabilidad AOA. Si una actividad real $a$ está representada por el par de sucesos $(s_a,f_a)$, entonces:
+
+$$
+a\neq b \Longrightarrow (s_a,f_a)\neq(s_b,f_b).
+$$
+
+Es decir, dos actividades reales distintas no pueden compartir simultáneamente el mismo suceso inicial y el mismo suceso final. Esta condición evita que una reducción convierta actividades paralelas reales en flechas indistinguibles entre los mismos dos sucesos. En esos casos una ficticia puede seguir siendo necesaria aunque la relación de precedencia $R_G=R_P$ se conserve.
+
 En código:
 
 ```python
@@ -151,6 +159,8 @@ Una contracción solo se acepta si:
 - ninguna actividad real queda con el mismo suceso inicial y final;
 - no aparecen arcos reales duplicados imposibles de distinguir;
 - la representación exacta se conserva.
+
+La tercera condición se comprueba sobre actividades reales, no sobre ficticias. Las ficticias paralelas de duración cero sí pueden deduplicarse porque no representan trabajo real; las actividades reales deben seguir identificándose por su par de sucesos.
 
 ## 8. Función objetivo
 
@@ -219,6 +229,26 @@ Para cada suceso $u$ se calcula su tiempo tardío $L(u)$:
 $$
 L(u)=\min_{(u,v)\in E}\left(L(v)-d_{uv}\right)
 $$
+
+Si la red tiene un único sumidero `T`, se inicializa $L(T)=E(T)$. Si una reducción deja varios sumideros, se usa:
+
+$$
+Z=\{z\in V\mid z\text{ no tiene sucesores}\}
+$$
+
+y:
+
+$$
+T_P=\max_{z\in Z}E(z).
+$$
+
+Entonces:
+
+$$
+L(z)=T_P \quad \text{para todo } z\in Z.
+$$
+
+Esto evita depender de un nombre concreto de suceso final y hace robusto el cálculo CPM tras reducciones topológicas seguras.
 
 Para una actividad real $a=(i,j)$ con duración $d_a$:
 

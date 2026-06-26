@@ -540,6 +540,19 @@ def real_activity_event_pairs(arcs: Sequence[Arc]) -> Dict[str, Tuple[str, str]]
     return pairs
 
 
+def has_unique_real_activity_event_pairs(arcs: Sequence[Arc]) -> bool:
+    """Return True when no two real activities share the same event pair."""
+    seen: Set[Tuple[str, str]] = set()
+    for arc in arcs:
+        if arc.kind != "real":
+            continue
+        pair = (arc.tail, arc.head)
+        if pair in seen:
+            return False
+        seen.add(pair)
+    return True
+
+
 def derived_activity_precedence(events: Sequence[str], arcs: Sequence[Arc]) -> Set[Tuple[str, str]]:
     """Infer activity precedence from an AoA network.
 
@@ -566,6 +579,8 @@ def is_exact_representation(events: Sequence[str], arcs: Sequence[Arc], target_c
     for arc in arcs:
         if arc.kind == "real" and arc.tail == arc.head:
             return False
+    if not has_unique_real_activity_event_pairs(arcs):
+        return False
     return derived_activity_precedence(events, arcs) == target_closure
 
 
@@ -995,12 +1010,15 @@ def compute_event_times(events: Sequence[str], arcs: Sequence[Arc]) -> Tuple[Dic
         for arc in outgoing.get(v, []):
             earliest[arc.head] = max(earliest[arc.head], earliest[v] + arc.duration)
 
-    sink = "T" if "T" in events else order[-1]
-    project_duration = earliest[sink]
+    sinks = [v for v in events if not outgoing.get(v)]
+    if "T" in events:
+        sinks = ["T"]
+    project_duration = max(earliest[v] for v in sinks)
     latest = {v: float("inf") for v in events}
-    latest[sink] = project_duration
+    for sink in sinks:
+        latest[sink] = project_duration
     for v in reversed(order):
-        if v == sink:
+        if v in sinks:
             continue
         if outgoing.get(v):
             latest[v] = min(latest[arc.head] - arc.duration for arc in outgoing[v])
@@ -1303,7 +1321,7 @@ def monte_carlo_simulation(
 
     source_indices = [i for i in range(len(events)) if not incoming_by_event[i]]
     sink_name = "T" if "T" in event_index else None
-    sink_idx = event_index[sink_name] if sink_name else -1
+    sink_indices = [event_index[sink_name]] if sink_name else [i for i in range(len(events)) if not outgoing_by_event[i]]
 
     rng = np.random.default_rng(seed)
     n_events = len(events)
@@ -1345,12 +1363,12 @@ def monte_carlo_simulation(
                 if candidate > earliest[head]:
                     earliest[head] = candidate
 
-        current_sink_idx = sink_idx if sink_idx >= 0 else int(np.argmax(earliest))
-        project_duration = float(earliest[current_sink_idx])
+        project_duration = float(max(earliest[idx] for idx in sink_indices))
         latest = np.full(n_events, float("inf"), dtype=float)
-        latest[current_sink_idx] = project_duration
+        for sink_idx in sink_indices:
+            latest[sink_idx] = project_duration
         for idx in reversed(ordered_indices):
-            if idx == current_sink_idx:
+            if idx in sink_indices:
                 continue
             outgoing = outgoing_by_event[idx]
             if outgoing:

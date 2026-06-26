@@ -360,6 +360,36 @@ Se lee así:
 
 > La red reducida representa exactamente las mismas precedencias que la tabla original: ni añade precedencias falsas ni elimina precedencias necesarias.
 
+Además, la aplicación exige una condición propia de la representación AOA: dos actividades reales distintas no pueden tener exactamente el mismo suceso inicial y el mismo suceso final.
+
+Formalmente, si:
+
+$$
+a=(i_a,j_a)
+$$
+
+y:
+
+$$
+b=(i_b,j_b),
+$$
+
+entonces, para actividades reales distintas:
+
+$$
+a\neq b \Longrightarrow (i_a,j_a)\neq(i_b,j_b).
+$$
+
+Esta condición significa que la aplicación:
+
+$$
+a\longmapsto(i_a,j_a)
+$$
+
+debe ser inyectiva sobre las actividades reales.
+
+No es solo una cuestión estética. Si dos actividades reales comparten los dos sucesos, quedan superpuestas como flechas paralelas entre el mismo par de eventos. La red puede seguir conservando $R_G=R_P$, pero deja de ser una representación AOA identificable: los sucesos ya no distinguen una actividad real de la otra. En ese caso puede ser necesario conservar una ficticia.
+
 ---
 
 ## 9. Por qué no se pueden borrar ficticias sin comprobar
@@ -440,6 +470,30 @@ Es decir:
 
 > Al fusionar los sucesos $u$ y $v$, la red sigue representando exactamente las mismas precedencias entre actividades reales.
 
+La aplicación añade una segunda comprobación: después de la contracción, las actividades reales deben seguir siendo identificables por sus pares de sucesos.
+
+Por tanto, una contracción segura debe cumplir simultáneamente:
+
+$$
+R_{G/(u\sim v)}=R_P
+$$
+
+y:
+
+$$
+a\neq b \Longrightarrow (i_a,j_a)\neq(i_b,j_b).
+$$
+
+Esta segunda condición explica por qué en un diamante:
+
+```text
+A -> B
+A -> C
+B,C -> D
+```
+
+puede seguir siendo necesaria una ficticia. Si se fusionan demasiado los sucesos, $B$ y $C$ podrían quedar como dos actividades reales paralelas con el mismo origen y el mismo destino. La precedencia lógica seguiría siendo correcta, pero la representación AOA perdería identificabilidad.
+
 ---
 
 ## 11. Eliminación segura de ficticias redundantes
@@ -474,7 +528,7 @@ La aplicación sigue este esquema:
 2. Calcular la relación de precedencia completa $R_P$ de la tabla.
 3. Probar contracciones de sucesos.
 4. Para cada contracción candidata, recalcular $R_G$.
-5. Aceptar la contracción solo si $R_G=R_P$.
+5. Aceptar la contracción solo si $R_G=R_P$ y las actividades reales siguen teniendo pares de sucesos distintos.
 6. Eliminar ficticias redundantes con el mismo criterio.
 7. Repetir mientras se pueda mejorar la red.
 
@@ -614,10 +668,28 @@ Se lee así:
 
 > $L_i$ es el instante más tardío en el que puede ocurrir el suceso $i$ sin retrasar el proyecto.
 
-El suceso final cumple:
+Si existe un único suceso final $T$, se cumple:
 
 $$
 L_T=E_T.
+$$
+
+En una red reducida puede ocurrir que no se conserve un único suceso llamado $T$. En ese caso se considera el conjunto de sucesos terminales:
+
+$$
+Z=\{z\in V\mid z\text{ no tiene flechas salientes}\}.
+$$
+
+La duración esperada del proyecto es:
+
+$$
+T_P=\max_{z\in Z}E_z.
+$$
+
+Todos los sucesos terminales se inicializan con esa misma fecha tardía:
+
+$$
+L_z=T_P \quad \text{para todo } z\in Z.
 $$
 
 Para cualquier otro suceso $i$, el tiempo tardío se calcula como:
